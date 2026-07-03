@@ -160,6 +160,30 @@ this session) · `q` (abort the turn). Toggle with `/tools on|off`; skip all pro
 Tool calling is implemented for Anthropic, OpenAI, and Gemini. Generic
 `openai-compatible` endpoints get tools too if they support OpenAI function calling.
 
+In agentic mode the model is instructed to orient itself first, **verify its work** by
+running it (trying `python3 -m …` / `pip3` / a local `.venv` before giving up), re-read a
+file after a failed edit instead of guessing twice, and finish with a one-line status.
+`edit_file` echoes the changed region back so the model can see the result. Each response
+prints its token usage (`↳ N in / N out`), and if a run hits the tool-call ceiling it
+forces a final summary of what's done and what's still broken.
+
+## Memory across runs
+
+Each `nexai -p` is a fresh conversation by default. Two mechanisms carry context forward:
+
+- **`NEXAIS.md`** — if a `NEXAIS.md` (or `.nexais/memory.md`) exists in the working
+  directory, its contents are loaded into the system prompt, and the agent is told to
+  record durable facts there (the exact build/test/run commands, layout, gotchas) as it
+  learns them. Drop notes in that file and every future run starts informed — no re-reading
+  the whole project to rediscover how to test it.
+- **`-c` / `--continue`** — continue the previous one-shot session in this directory
+  (persisted to `./.nexais/session.json`):
+
+  ```bash
+  nexai -c -p "build a CLI that counts words in a file"
+  nexai -c -p "now add a --json flag"     # remembers the previous turn
+  ```
+
 ## All commands
 
 ```

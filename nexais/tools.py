@@ -79,12 +79,28 @@ def _edit_file(args: dict[str, Any]) -> str:
         return "Error: old_string not found in file. Read the file first to copy exact text."
     if count > 1 and not args.get("replace_all"):
         return f"Error: old_string appears {count} times. Make it unique or set replace_all=true."
-    text = text.replace(old, new)
+    new_text = text.replace(old, new)
     try:
-        path.write_text(text)
+        path.write_text(new_text)
     except OSError as e:
         return f"Error writing {path}: {e}"
-    return f"Replaced {count if args.get('replace_all') else 1} occurrence(s) in {path}"
+    n = count if args.get("replace_all") else 1
+    return f"Replaced {n} occurrence(s) in {path}.\n{_changed_region(new_text, new)}"
+
+
+def _changed_region(new_text: str, inserted: str) -> str:
+    """Show the edited region (line-numbered, ±3 lines) so the model can see
+    the actual result — indentation included — instead of editing blind."""
+    idx = new_text.find(inserted)
+    lines = new_text.splitlines()
+    if idx == -1:
+        return "Updated file."
+    start_line = new_text.count("\n", 0, idx)
+    end_line = start_line + inserted.count("\n")
+    lo = max(0, start_line - 3)
+    hi = min(len(lines), end_line + 4)
+    body = "\n".join(f"{i + 1}\t{lines[i]}" for i in range(lo, hi))
+    return f"Updated region:\n{body}"
 
 
 def _list_dir(args: dict[str, Any]) -> str:

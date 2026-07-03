@@ -114,6 +114,11 @@ class OpenAIProvider(Provider):
             "messages": self._messages_to_wire(messages, system),
             "stream": True,
         }
+        # Ask the API to emit a final usage chunk while streaming, otherwise no
+        # token counts come back and cost reporting is silently blank. A few
+        # strict OpenAI-compatible servers reject it — set stream_usage=false.
+        if self.config.get("stream_usage", True):
+            body["stream_options"] = {"include_usage": True}
         if max_tokens:
             body["max_tokens"] = max_tokens
         if temperature is not None:

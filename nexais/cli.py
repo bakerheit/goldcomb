@@ -43,6 +43,36 @@ COMMANDS = [
 
 MAX_TOOL_ITERATIONS = 30
 
+AGENT_INSTRUCTIONS = """\
+You are nexais, an AI coding agent running in the user's terminal. The working \
+directory is {cwd}. Today's date is {date}. You have tools to read, write, and \
+edit files and run shell commands. Prefer acting through tools over describing \
+what you would do, and don't hand a task back to the user that you can do yourself.
+
+Orient first. At the start of a task, check for a NEXAIS.md, README, or test \
+config to learn how this project is built and tested, and match its existing \
+conventions (test framework, layout, style) — don't introduce new ones.
+
+Verify your work. After writing or changing code, run it or its tests. If a \
+command seems missing (e.g. pytest, pip), try alternatives before giving up: \
+`python3 -m pytest`, `python3 -m pip`, `pip3`, or a local virtualenv \
+(`.venv/bin/python`). Don't report success you haven't checked.
+
+Editing rules. Read a file before you edit it. After an edit, if the next \
+command shows the SAME error, RE-READ the file to see its exact current \
+contents before editing again — never guess twice. Never run the same failing \
+command more than twice without changing your approach. For small files, prefer \
+rewriting the whole file with write_file over a chain of edit_file calls \
+(surgical edits are error-prone in indentation-sensitive languages).
+
+Remember for next time. When you discover a durable project fact — the exact \
+build/test/run command, the entry point, the layout, or a gotcha — record it in \
+NEXAIS.md (create or append) so future sessions start informed. This is your \
+memory across runs; you start each run fresh otherwise.
+
+Finish cleanly. End with one short line: what you did and whether tests pass. \
+Skip narrating a plan before each tool call."""
+
 
 class App:
     def __init__(self, cfg: Config, console: Console | None = None):
@@ -52,6 +82,8 @@ class App:
         self.approved_tools: set[str] = set()
         self.auto_approve = False
         self._last_models: list[str] = []  # remembered from the last /models
+        self._cmd_counts: dict[str, int] = {}
+        self._edit_counts: dict[str, int] = {}
 
     # ---- provider / model helpers -----------------------------------------
 
@@ -65,26 +97,41 @@ class App:
         entry["api_key"] = self.cfg.resolve_api_key(name)
         return build_provider(name, entry)
 
+    MEMORY_FILES = ("NEXAIS.md", ".nexais/memory.md")
+    MEMORY_MAX_CHARS = 6000
+
     def system_prompt(self) -> str | None:
         parts = []
         if self.cfg.settings.get("tools_enabled"):
-            cwd = Path.cwd()
             parts.append(
-                "You are nexais, a concise AI coding assistant running in the user's "
-                f"terminal. The working directory is {cwd}. You can read and write "
-                "files and run shell commands via the provided tools. Prefer acting "
-                "through tools over describing what you would do. Today's date is "
-                f"{date.today().isoformat()}."
+                AGENT_INSTRUCTIONS.format(cwd=Path.cwd(), date=date.today().isoformat())
             )
+            mem_name, mem_text = self._read_memory_file()
+            if mem_text:
+                parts.append(f"Project notes (from {mem_name} — keep this file updated):\n{mem_text}")
         user_sys = self.cfg.settings.get("system_prompt")
         if user_sys:
             parts.append(user_sys)
         return "\n\n".join(parts) if parts else None
 
+    def _read_memory_file(self) -> tuple[str | None, str | None]:
+        cwd = Path.cwd()
+        for rel in self.MEMORY_FILES:
+            p = cwd / rel
+            try:
+                if p.is_file():
+                    text = p.read_text(errors="replace")[: self.MEMORY_MAX_CHARS]
+                    return rel, text
+            except OSError:
+                continue
+        return None, None
+
     # ---- the agentic turn --------------------------------------------------
 
     def run_turn(self, user_text: str) -> None:
         self.messages.append(Message(role="user", content=user_text))
+        self._cmd_counts = {}
+        self._edit_counts = {}
         try:
             provider = self.get_provider()
         except ProviderError as e:
@@ -107,10 +154,25 @@ class App:
                 self.messages.extend(results)
                 continue
             return
-        self.console.print("[yellow]Reached maximum tool iterations.[/yellow]")
 
-    def _stream_once(self, provider: Provider):
-        tools = tool_specs() if self.cfg.settings.get("tools_enabled") else None
+        # Hit the tool-call ceiling: force a final wrap-up instead of a bare exit
+        # that leaves the user with a half-finished, possibly broken state.
+        self.console.print("[yellow]Reached the tool-call limit — summarizing.[/yellow]")
+        self.messages.append(
+            Message(
+                role="user",
+                content="You've reached the tool-call limit and cannot call more "
+                "tools. In 2-4 sentences, summarize what you changed, what "
+                "currently works, and what is still broken or unfinished.",
+            )
+        )
+        message, _ = self._stream_once(provider, force_no_tools=True)
+        if message is not None:
+            self.messages.append(message)
+
+    def _stream_once(self, provider: Provider, force_no_tools: bool = False):
+        use_tools = self.cfg.settings.get("tools_enabled") and not force_no_tools
+        tools = tool_specs() if use_tools else None
         settings = self.cfg.settings
         text_acc: list[str] = []
         printed_label = False
@@ -204,10 +266,36 @@ class App:
             except Exception as e:  # noqa: BLE001 - surface tool errors to the model
                 output = f"Error executing tool: {e}"
             self._preview(output)
+            nudge = self._loop_nudge(call)
+            if nudge:
+                output = f"{output}\n\n[nexais] {nudge}"
+                self.console.print(f"[yellow]  ↳ {nudge}[/yellow]")
             results.append(
                 Message(role="tool", content=output, tool_call_id=call.id, name=call.name)
             )
         return results
+
+    def _loop_nudge(self, call) -> str | None:
+        """Detect thrashing (repeating a failing command or re-editing the same
+        file) and return a nudge to inject into the tool result."""
+        args = call.arguments or {}
+        if call.name == "run_bash":
+            cmd = args.get("command", "")
+            self._cmd_counts[cmd] = self._cmd_counts.get(cmd, 0) + 1
+            if self._cmd_counts[cmd] >= 2:
+                return (
+                    f"You have run this exact command {self._cmd_counts[cmd]} times. "
+                    "Stop repeating it — re-read the relevant file and change your approach."
+                )
+        elif call.name == "edit_file":
+            path = args.get("path", "")
+            self._edit_counts[path] = self._edit_counts.get(path, 0) + 1
+            if self._edit_counts[path] >= 3:
+                return (
+                    f"You've edited {path} {self._edit_counts[path]} times. Re-read the "
+                    "whole file, then rewrite it in one write_file call instead of more edits."
+                )
+        return None
 
     def _confirm(self, summary: str) -> str:
         self.console.print(
@@ -855,6 +943,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", help="Override the active provider for this run.")
     parser.add_argument("--model", help="Override the active model for this run.")
     parser.add_argument("--no-tools", action="store_true", help="Disable file/shell tools.")
+    parser.add_argument("-c", "--continue", dest="cont", action="store_true",
+                        help="Continue the previous one-shot session in this directory "
+                             "(persists to ./.nexais/session.json).")
     parser.add_argument("-V", "--version", action="version",
                         version=f"nexais {__version__}")
     args = parser.parse_args(argv)
@@ -892,10 +983,27 @@ def main(argv: list[str] | None = None) -> int:
             print("No provider configured. Run `nexais` and use /setup.", file=sys.stderr)
             return 2
         app.auto_approve = True  # non-interactive: don't block on confirmations
+        sess_path = Path.cwd() / ".nexais" / "session.json"
+        if args.cont and sess_path.exists():
+            try:
+                data = json.loads(sess_path.read_text())
+                app.messages = [Message.from_dict(m) for m in data.get("messages", [])]
+                if app.messages:
+                    console.print(f"[dim]Continuing session ({len(app.messages)} prior messages).[/dim]")
+            except (OSError, json.JSONDecodeError):
+                pass
         try:
             app.run_turn(oneshot)
         except KeyboardInterrupt:
             return 130
+        if args.cont:
+            try:
+                sess_path.parent.mkdir(parents=True, exist_ok=True)
+                sess_path.write_text(
+                    json.dumps({"messages": [m.to_dict() for m in app.messages]}, indent=2)
+                )
+            except OSError:
+                pass
         return 0
 
     try:
