@@ -30,13 +30,25 @@ The dependencies are httpx, rich, and prompt_toolkit…
 
 Requires Python 3.10+.
 
+**One command (recommended)** — creates a virtualenv and a short `nexai` command on your PATH:
+
 ```bash
-pip install -e .          # from this directory
-# or, without installing:
-python -m nexais
+./install.sh              # command: nexai   (into ~/.local/bin)
+./install.sh myai         # name it something else
+./install.sh nexai --bin /usr/local/bin
 ```
 
-This installs a `nexais` command. Dependencies: `httpx`, `rich`, `prompt_toolkit`.
+If the target bin dir isn't on your PATH, the script prints the exact `export PATH=…` line to add.
+
+**Manual** — if you'd rather manage it yourself:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/nexais           # or:  python -m nexais
+```
+
+Dependencies: `httpx`, `rich`, `prompt_toolkit`.
 
 ## Quick start
 
