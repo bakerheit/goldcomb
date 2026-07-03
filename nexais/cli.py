@@ -35,10 +35,11 @@ from .providers import (
 )
 from .providers import PROVIDER_TYPES
 from .tools import TOOLS_BY_NAME, describe_call, tool_specs
+from .ui import Renderer
 
 COMMANDS = [
     "help", "setup", "provider", "use", "model", "models", "system", "tools",
-    "auto", "set", "clear", "history", "save", "load", "config", "exit",
+    "auto", "render", "set", "clear", "history", "save", "load", "config", "exit",
 ]
 
 MAX_TOOL_ITERATIONS = 30
@@ -84,6 +85,10 @@ class App:
         self._last_models: list[str] = []  # remembered from the last /models
         self._cmd_counts: dict[str, int] = {}
         self._edit_counts: dict[str, int] = {}
+        self.session_tokens = {"in": 0, "out": 0}
+        self.renderer = Renderer(
+            self.console, markdown=bool(self.cfg.settings.get("render_markdown", True))
+        )
 
     # ---- provider / model helpers -----------------------------------------
 
@@ -113,6 +118,16 @@ class App:
         if user_sys:
             parts.append(user_sys)
         return "\n\n".join(parts) if parts else None
+
+    def context_estimate(self) -> int:
+        """Rough token estimate of the current conversation (~4 chars/token),
+        for the status bar. Cheap — no file IO, no model call."""
+        total = 0
+        for m in self.messages:
+            total += len(m.content or "")
+            for t in m.tool_calls:
+                total += len(t.name) + len(str(t.arguments))
+        return total // 4
 
     def _read_memory_file(self) -> tuple[str | None, str | None]:
         cwd = Path.cwd()
@@ -175,8 +190,9 @@ class App:
         tools = tool_specs() if use_tools else None
         settings = self.cfg.settings
         text_acc: list[str] = []
-        printed_label = False
+        streaming = False  # have we begun rendering assistant text?
         completed: Completed | None = None
+        self.renderer.start_status("Thinking")
         try:
             stream = provider.stream(
                 self.messages,
@@ -188,52 +204,51 @@ class App:
             )
             for ev in stream:
                 if isinstance(ev, TextDelta):
-                    if not printed_label:
-                        self.console.print(
-                            f"[bold cyan]{self.cfg.current_provider}[/bold cyan] "
-                            f"[dim]({self.cfg.current_model})[/dim]"
+                    if not streaming:
+                        self.renderer.begin_message(
+                            self.cfg.current_provider or "", self.cfg.current_model or ""
                         )
-                        printed_label = True
+                        streaming = True
                     text_acc.append(ev.text)
-                    sys.stdout.write(ev.text)
-                    sys.stdout.flush()
+                    self.renderer.message_delta(ev.text)
                 elif isinstance(ev, ThinkingDelta):
-                    pass  # reasoning stream; not shown by default
+                    self.renderer.update_status("Thinking")
                 elif isinstance(ev, Completed):
                     completed = ev
-            if printed_label:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+            if streaming:
+                self.renderer.end_message()
+            self.renderer.stop_status()
         except ProviderError as e:
-            if printed_label:
-                sys.stdout.write("\n")
+            self.renderer.stop_all()
+            if streaming:
+                self.renderer.end_message()
             self.console.print(f"[red]Error:[/red] {e}")
             return None, "error"
         except KeyboardInterrupt:
-            sys.stdout.write("\n")
+            self.renderer.stop_all()
+            if streaming:
+                self.renderer.end_message()
             self.console.print("[yellow]⏹ interrupted[/yellow]")
             partial = "".join(text_acc)
             return (Message(role="assistant", content=partial) if partial else None), "interrupted"
 
         if completed is not None:
-            self._show_usage(completed.usage)
+            self._record_usage(completed.usage)
             return completed.message, completed.stop_reason
         # No completion event and no text — treat as empty assistant turn.
         return Message(role="assistant", content="".join(text_acc)), "end_turn"
 
-    def _show_usage(self, usage: dict[str, int]) -> None:
-        if usage.get("input_tokens") or usage.get("output_tokens"):
-            self.console.print(
-                f"[dim]  ↳ {usage.get('input_tokens', 0)} in / "
-                f"{usage.get('output_tokens', 0)} out tokens[/dim]"
-            )
+    def _record_usage(self, usage: dict[str, int]) -> None:
+        self.session_tokens["in"] += usage.get("input_tokens", 0)
+        self.session_tokens["out"] += usage.get("output_tokens", 0)
+        self.renderer.usage(usage, self.session_tokens)
 
     def _run_tools(self, tool_calls) -> list[Message] | None:
         results: list[Message] = []
         for call in tool_calls:
             tool = TOOLS_BY_NAME.get(call.name)
             summary = describe_call(call.name, call.arguments)
-            self.console.print(f"[magenta]⚙ {summary}[/magenta]")
+            self.renderer.tool_call(summary)
             if tool is None:
                 results.append(
                     Message(
@@ -261,15 +276,17 @@ class App:
                     continue
                 if decision == "always":
                     self.approved_tools.add(call.name)
+            self.renderer.update_status(f"Running {call.name}")
             try:
                 output = tool.run(call.arguments)
             except Exception as e:  # noqa: BLE001 - surface tool errors to the model
                 output = f"Error executing tool: {e}"
-            self._preview(output)
+            self.renderer.stop_status()
+            self.renderer.tool_result(output)
             nudge = self._loop_nudge(call)
             if nudge:
                 output = f"{output}\n\n[nexais] {nudge}"
-                self.console.print(f"[yellow]  ↳ {nudge}[/yellow]")
+                self.renderer.nudge(nudge)
             results.append(
                 Message(role="tool", content=output, tool_call_id=call.id, name=call.name)
             )
@@ -313,14 +330,6 @@ class App:
             return "abort"
         return "deny"
 
-    def _preview(self, output: str) -> None:
-        lines = output.splitlines()
-        shown = lines[:12]
-        for ln in shown:
-            self.console.print(f"[dim]  {ln}[/dim]", highlight=False)
-        if len(lines) > len(shown):
-            self.console.print(f"[dim]  … (+{len(lines) - len(shown)} lines)[/dim]")
-
     # ---- slash commands ----------------------------------------------------
 
     def handle_command(self, line: str) -> bool:
@@ -343,6 +352,7 @@ class App:
             "system": self.cmd_system,
             "tools": self.cmd_tools,
             "auto": self.cmd_auto,
+            "render": self.cmd_render,
             "set": self.cmd_set,
             "clear": self.cmd_clear,
             "history": self.cmd_history,
@@ -714,6 +724,18 @@ class App:
             f"Auto-approve tool calls: [cyan]{'on' if self.auto_approve else 'off'}[/cyan]"
         )
 
+    def cmd_render(self, args) -> None:
+        if args and args[0] in ("on", "off"):
+            self.cfg.set_setting("render_markdown", args[0] == "on")
+        elif args:
+            self.console.print(r"[red]Usage:[/red] /render \[on|off]")
+            return
+        self.renderer.markdown = bool(self.cfg.settings.get("render_markdown"))
+        state = "on" if self.renderer.markdown else "off"
+        self.console.print(
+            f"Markdown rendering: [cyan]{state}[/cyan]  [dim](off = plain streamed text)[/dim]"
+        )
+
     def cmd_set(self, args) -> None:
         if len(args) < 2:
             self.console.print("[red]Usage:[/red] /set <max_tokens|temperature> <value>")
@@ -809,6 +831,7 @@ HELP_TEXT = r"""[bold]nexais commands[/bold]
   [cyan]/system[/cyan] \[prompt|clear]                  show/set system prompt
   [cyan]/tools[/cyan] \[on|off]                         toggle file/shell tools
   [cyan]/auto[/cyan] \[on|off]                          auto-approve tool calls
+  [cyan]/render[/cyan] \[on|off]                        markdown vs plain streaming
   [cyan]/set[/cyan] max_tokens|temperature <value>     tune generation
   [cyan]/clear[/cyan]                                  reset the conversation
   [cyan]/history[/cyan]                                list messages so far
@@ -823,6 +846,14 @@ Type a message to chat. Ctrl-C interrupts a response; Ctrl-D or /exit quits."""
 
 
 # ---- REPL & entry point -----------------------------------------------------
+
+
+def _fmt_k(n: int) -> str:
+    if n >= 10000:
+        return f"{n // 1000}k"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
 
 
 def _build_prompt_session(app: App):
@@ -858,6 +889,7 @@ def _build_prompt_session(app: App):
             "/system": {"clear": None},
             "/tools": {"on": None, "off": None},
             "/auto": {"on": None, "off": None},
+            "/render": {"on": None, "off": None},
             "/set": {"max_tokens": None, "temperature": None},
             "/clear": None,
             "/history": None,
@@ -872,10 +904,19 @@ def _build_prompt_session(app: App):
     session = PromptSession(history=FileHistory(str(hist_path)))
 
     def bottom_toolbar():
-        p = app.cfg.current_provider or "no-provider"
-        m = app.cfg.current_model or "no-model"
-        t = "tools" if app.cfg.settings.get("tools_enabled") else "no-tools"
-        return f" {p}:{m} | {t} "
+        c = app.cfg
+        p = c.current_provider or "no-provider"
+        m = c.current_model or "no-model"
+        st = app.session_tokens
+        flags = ["tools" if c.settings.get("tools_enabled") else "no-tools"]
+        if app.auto_approve:
+            flags.append("auto")
+        if not c.settings.get("render_markdown"):
+            flags.append("plain")
+        return (
+            f" {p} · {m}   ⬆{_fmt_k(st['in'])} ⬇{_fmt_k(st['out'])}   "
+            f"ctx ~{_fmt_k(app.context_estimate())}   {' '.join(flags)} "
+        )
 
     def prompt() -> str:
         return session.prompt(
@@ -891,9 +932,10 @@ def repl(app: App) -> None:
     console = app.console
     console.print(
         Panel.fit(
-            "[bold]nexais[/bold] — multi-provider AI agent for the terminal\n"
-            "[dim]Type /help for commands, /exit to quit.[/dim]",
+            f"[bold cyan]nexais[/bold cyan] [dim]v{__version__}[/dim] — multi-provider AI agent\n"
+            "[dim]/help for commands · /setup to add a provider · /exit to quit[/dim]",
             border_style="cyan",
+            padding=(0, 1),
         )
     )
     prompt = _build_prompt_session(app)

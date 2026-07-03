@@ -18,6 +18,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tools_enabled": True,
     "system_prompt": None,
     "stream": True,
+    "render_markdown": True,
 }
 
 # env var -> (provider name, type)

@@ -184,6 +184,20 @@ Each `nexai -p` is a fresh conversation by default. Two mechanisms carry context
   nexai -c -p "now add a --json flag"     # remembers the previous turn
   ```
 
+## Interactive UI
+
+The REPL is built for a terminal: an animated **"Thinking…" spinner** while the model
+works and while each tool runs, **markdown-rendered** responses that stream live (code
+blocks, headers, lists, bold), and tool-output previews that **shrink to fit** short
+terminals. A status bar reflows on resize and shows what matters:
+
+```
+ openai · gpt-4o   ⬆12.4k ⬇3.1k   ctx ~5.2k   tools auto
+```
+
+provider · model · session tokens up/down · rough context size · active flags. Prefer
+plain streamed text? `/render off` (markdown back on with `/render on`).
+
 ## All commands
 
 ```
