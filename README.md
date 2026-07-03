@@ -65,6 +65,41 @@ command.
 
 ## Configure providers with a slash command
 
+**Easiest: `/setup`** — a guided menu. Pick a provider from a numbered list, paste your
+key, and you're done. base URLs and default models are filled in for you. On first run
+(with no provider configured) this launches automatically.
+
+```
+› /setup
+─────────────────── Add a provider ───────────────────
+Which provider would you like to use?
+   1  Anthropic — Claude
+   2  OpenAI — GPT
+   3  Google — Gemini
+   4  OpenRouter — hundreds of models via one key
+   5  Groq — very fast open models
+   6  DeepSeek
+   7  Mistral
+   8  Together AI
+   9  Ollama — local models (no key)
+  10  LM Studio — local models (no key)
+  11  Custom — any OpenAI-compatible endpoint (you give a URL)
+Enter a number or name (blank to cancel): 4
+Need a key? Get one at: https://openrouter.ai/keys
+Paste your OpenRouter API key: ****
+✓ Added 'openrouter' (openai-compatible)
+```
+
+**Shortcut: preset by name.** Any preset can be added in one line — base URL and default
+model come from the preset, and the key is prompted for (hidden):
+
+```
+/provider add anthropic       # or: openai, gemini, openrouter, groq,
+/provider add groq            #     deepseek, mistral, together, ollama, lmstudio
+```
+
+**Full control (scriptable):**
+
 ```
 /provider add <name> <type> [api_key] [base_url]
 ```
@@ -74,11 +109,8 @@ command.
 prompted for (hidden). `openai-compatible` requires a `base_url`.
 
 ```
-/provider add claude   anthropic
-/provider add oai      openai
-/provider add gflash   gemini
+/provider add oai      openai        sk-...
 /provider add local    openai-compatible  ""  http://localhost:11434/v1   # Ollama
-/provider add router   openrouter                                          # preset base_url
 ```
 
 Other provider commands:
@@ -94,9 +126,13 @@ Other provider commands:
 ```
 /use <provider> [model]     switch active provider (and optionally model)
 /model <name>               set the model on the current provider
+/model <number>             pick by number from the last /models list
 /model list                 known models for this provider type
-/models                     query the provider's API for its live model list
+/models [provider] [filter] numbered live model list (filter is a substring)
 ```
+
+`/models` prints a numbered list; then `/model 7` selects the 7th. Right after adding a
+provider, nexais offers to fetch its model list so you can pick without typing an ID.
 
 ```
 › /use claude claude-sonnet-5
