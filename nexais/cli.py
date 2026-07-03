@@ -584,6 +584,7 @@ class App:
         if not models:
             self.console.print("[dim]No models returned. Set one with /model <name>.[/dim]")
             return
+        self.cfg.cache_models(name, models)
         self._last_models = models
         for i, m in enumerate(models[:40], 1):
             self.console.print(f"  [cyan]{i:>2}[/cyan]  {m}")
@@ -659,15 +660,22 @@ class App:
                 )
             return
         if args[0] == "list":
-            ptype = self.cfg.providers.get(self.cfg.current_provider or "", {}).get("type", "")
-            models = default_models_for(ptype)
+            provider = self.cfg.current_provider
+            ptype = self.cfg.providers.get(provider or "", {}).get("type", "")
+            cached = self.cfg.models_for(provider)
+            models = cached or default_models_for(ptype)
             if models:
-                self.console.print("Known models for this provider type:")
+                if cached:
+                    self.console.print(f"Models for [cyan]{provider}[/cyan] [dim](cached from the API)[/dim]:")
+                else:
+                    self.console.print("Common models for this provider type:")
                 for m in models:
-                    self.console.print(f"  {m}")
-                self.console.print("[dim]Use /models to query the API for the full live list.[/dim]")
+                    marker = " [green]← current[/green]" if m == self.cfg.current_model else ""
+                    self.console.print(f"  {m}{marker}")
+                if not cached:
+                    self.console.print("[dim]Run /models to fetch the full live list from the API.[/dim]")
             else:
-                self.console.print("[dim]No static model list; try /models.[/dim]")
+                self.console.print("[dim]No known models; run /models to fetch them.[/dim]")
             return
         choice = args[0]
         # `/model 3` picks the 3rd entry from the last /models listing.
@@ -707,6 +715,9 @@ class App:
         except ProviderError as e:
             self.console.print(f"[red]{e}[/red]")
             return
+        # Remember the full live catalog so /model list and completion have it
+        # offline from now on.
+        self.cfg.cache_models(name, models)
         if filt:
             models = [m for m in models if filt.lower() in m.lower()]
             if not models:
@@ -893,11 +904,13 @@ def _build_prompt_session(app: App):
     def completer_dict() -> dict:
         provider_names = {n: None for n in app.cfg.providers}
         preset_keys = {p.key: None for p in PRESETS}
-        model_names = {m: None for m in app._last_models} or {
-            m: None for m in default_models_for(
-                app.cfg.providers.get(app.cfg.current_provider or "", {}).get("type", "")
-            )
-        }
+        cur = app.cfg.current_provider or ""
+        model_list = (
+            app._last_models
+            or app.cfg.models_for(cur)
+            or default_models_for(app.cfg.providers.get(cur, {}).get("type", ""))
+        )
+        model_names = {m: None for m in model_list}
         return {
             "/help": None,
             "/setup": None,

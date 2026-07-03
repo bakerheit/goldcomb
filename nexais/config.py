@@ -64,6 +64,9 @@ class Config:
         self.providers: dict[str, dict[str, Any]] = data.get("providers", {})
         self.current: dict[str, str] = data.get("current", {})
         self.settings: dict[str, Any] = {**DEFAULT_SETTINGS, **data.get("settings", {})}
+        # Live model lists remembered per provider after a /models fetch, so the
+        # full real catalog is available offline for /model list and completion.
+        self.models_cache: dict[str, list[str]] = data.get("models_cache", {})
 
     # ---- persistence -------------------------------------------------------
 
@@ -89,6 +92,7 @@ class Config:
             "providers": self.providers,
             "current": self.current,
             "settings": self.settings,
+            "models_cache": self.models_cache,
         }
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2))
@@ -188,3 +192,12 @@ class Config:
     def set_setting(self, key: str, value: Any) -> None:
         self.settings[key] = value
         self.save()
+
+    # ---- model cache -------------------------------------------------------
+
+    def cache_models(self, provider: str, models: list[str]) -> None:
+        self.models_cache[provider] = list(models)
+        self.save()
+
+    def models_for(self, provider: str | None) -> list[str]:
+        return list(self.models_cache.get(provider or "", []))

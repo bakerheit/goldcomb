@@ -29,13 +29,19 @@ from .base import (
 class OpenAIProvider(Provider):
     type_name = "openai"
     default_base_url = "https://api.openai.com/v1"
+    # Curated fallback shown before a live /models fetch (which caches the full
+    # real catalog). Not exhaustive — run /models for everything the key can see.
     default_models = [
-        "gpt-4o",
-        "gpt-4o-mini",
+        "gpt-5",
         "gpt-4.1",
         "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "chatgpt-4o-latest",
         "o3",
         "o4-mini",
+        "o1",
     ]
 
     @property
