@@ -7,7 +7,13 @@ Python implementation. Tools that mutate state (write/edit/bash) are flagged
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
+import signal
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -15,6 +21,44 @@ from typing import Any, Callable
 from .providers import ToolSpec
 
 MAX_OUTPUT = 30_000  # cap tool output returned to the model
+# Refuse / abort a shell command if free disk falls below this floor. A runaway
+# copy that would fill the disk is killed here instead of taking the machine down.
+MIN_FREE_MB = int(os.environ.get("NEXAIS_MIN_FREE_MB", "500"))
+
+# Unambiguously catastrophic commands we refuse to run at all.
+_CATASTROPHIC = [
+    (re.compile(r"\brm\b[^|;&\n]*\s-[a-zA-Z]*[rf][a-zA-Z]*[^|;&\n]*"
+                r"\s(/|/\*|~|~/|\$HOME|/Users/?|/home/?|\.\.)(\s|$)"),
+     "rm -rf targeting a root/home/parent path"),
+    (re.compile(r":\s*\(\s*\)\s*\{[^}]*\|\s*:[^}]*\}\s*;\s*:"), "fork bomb"),
+    (re.compile(r"\bdd\b[^|;&\n]*\bof=/dev/"), "dd writing to a device"),
+    (re.compile(r"\bmkfs\b"), "mkfs (formats a filesystem)"),
+    (re.compile(r">\s*/dev/(sd|disk|nvme|hd)"), "writing to a raw disk device"),
+]
+
+
+def catastrophic_reason(command: str) -> str | None:
+    for pat, why in _CATASTROPHIC:
+        if pat.search(command):
+            return why
+    return None
+
+
+def _free_mb(path: str) -> int:
+    try:
+        return shutil.disk_usage(path).free // (1024 * 1024)
+    except OSError:
+        return -1
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.kill()
+        except Exception:  # pragma: no cover
+            pass
 
 
 @dataclass
@@ -120,24 +164,68 @@ def _list_dir(args: dict[str, Any]) -> str:
 def _run_bash(args: dict[str, Any]) -> str:
     cmd = args["command"]
     timeout = int(args.get("timeout", 120) or 120)
+
+    reason = catastrophic_reason(cmd)
+    if reason:
+        return f"Refused: this command looks destructive ({reason}). Not running it."
     try:
-        proc = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        cwd = os.getcwd()
+    except OSError:
+        return "Error: the current working directory is no longer accessible."
+    free = _free_mb(cwd)
+    if 0 <= free < MIN_FREE_MB:
+        return (
+            f"Refused: only {free} MB free on disk (floor {MIN_FREE_MB} MB). "
+            "Free up space before running commands that could write more."
         )
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {timeout}s"
+
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=cwd, start_new_session=True,  # own process group → killable as a tree
+        )
     except Exception as e:  # pragma: no cover
         return f"Error running command: {e}"
-    out = proc.stdout or ""
-    err = proc.stderr or ""
+
+    # Disk sentinel: if free space crosses the floor mid-command (e.g. a runaway
+    # copy), kill the whole process tree before it fills the disk.
+    killed: dict[str, str | None] = {"reason": None}
+
+    def _watchdog() -> None:
+        while proc.poll() is None:
+            f = _free_mb(cwd)
+            if 0 <= f < MIN_FREE_MB:
+                killed["reason"] = f"free disk fell below {MIN_FREE_MB} MB"
+                _kill_group(proc)
+                return
+            time.sleep(0.5)
+
+    watcher = threading.Thread(target=_watchdog, daemon=True)
+    watcher.start()
+
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        out, err = proc.communicate()
+        return _truncate(_bash_output(out, err, None) + f"\n[killed: timed out after {timeout}s]")
+    if killed["reason"]:
+        return _truncate(
+            _bash_output(out, err, None)
+            + f"\n[KILLED: {killed['reason']} — aborted to protect the disk]"
+        )
+    return _truncate(_bash_output(out, err, proc.returncode)) or "(no output)"
+
+
+def _bash_output(out: str, err: str, code: int | None) -> str:
     parts = []
     if out:
         parts.append(out)
     if err:
         parts.append(f"[stderr]\n{err}")
-    if proc.returncode != 0:
-        parts.append(f"[exit code {proc.returncode}]")
-    return _truncate("\n".join(parts)) if parts else "(no output)"
+    if code not in (0, None):
+        parts.append(f"[exit code {code}]")
+    return "\n".join(parts)
 
 
 BUILTIN_TOOLS: list[Tool] = [
@@ -225,6 +313,13 @@ TOOLS_BY_NAME: dict[str, Tool] = {t.name: t for t in BUILTIN_TOOLS}
 
 def tool_specs() -> list[ToolSpec]:
     return [t.spec for t in BUILTIN_TOOLS]
+
+
+def missing_required_args(tool: Tool, args: dict[str, Any] | None) -> list[str]:
+    """Required params (from the tool's schema) absent from the model's call."""
+    required = tool.spec.parameters.get("required", []) or []
+    have = args or {}
+    return [r for r in required if r not in have]
 
 
 def describe_call(name: str, args: dict[str, Any]) -> str:

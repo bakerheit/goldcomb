@@ -34,7 +34,7 @@ from .providers import (
     normalize_type,
 )
 from .providers import PROVIDER_TYPES
-from .tools import TOOLS_BY_NAME, describe_call, tool_specs
+from .tools import TOOLS_BY_NAME, describe_call, missing_required_args, tool_specs
 from .ui import Renderer
 
 COMMANDS = [
@@ -72,7 +72,9 @@ NEXAIS.md (create or append) so future sessions start informed. This is your \
 memory across runs; you start each run fresh otherwise.
 
 Finish cleanly. End with one short line: what you did and whether tests pass. \
-Skip narrating a plan before each tool call."""
+Skip narrating a plan before each tool call. If you added or changed a test, \
+don't stop while it is failing — fix it, or revert the broken change and say the \
+work is unfinished. Never end a turn with a test you introduced left red."""
 
 
 class App:
@@ -108,8 +110,12 @@ class App:
     def system_prompt(self) -> str | None:
         parts = []
         if self.cfg.settings.get("tools_enabled"):
+            try:
+                cwd = Path.cwd()
+            except OSError:
+                cwd = Path("(working directory unavailable)")
             parts.append(
-                AGENT_INSTRUCTIONS.format(cwd=Path.cwd(), date=date.today().isoformat())
+                AGENT_INSTRUCTIONS.format(cwd=cwd, date=date.today().isoformat())
             )
             mem_name, mem_text = self._read_memory_file()
             if mem_text:
@@ -130,7 +136,10 @@ class App:
         return total // 4
 
     def _read_memory_file(self) -> tuple[str | None, str | None]:
-        cwd = Path.cwd()
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            return None, None
         for rel in self.MEMORY_FILES:
             p = cwd / rel
             try:
@@ -153,37 +162,47 @@ class App:
             self.console.print(f"[red]{e}[/red]")
             return
 
-        for _ in range(MAX_TOOL_ITERATIONS):
-            message, stop = self._stream_once(provider)
-            if message is None:
-                return
-            self.messages.append(message)
-            if (
-                stop == "tool_use"
-                and message.tool_calls
-                and self.cfg.settings.get("tools_enabled")
-            ):
-                results = self._run_tools(message.tool_calls)
-                if results is None:  # user aborted the whole turn
+        try:
+            for _ in range(MAX_TOOL_ITERATIONS):
+                message, stop = self._stream_once(provider)
+                if message is None:
                     return
-                self.messages.extend(results)
-                continue
-            return
+                self.messages.append(message)
+                if (
+                    stop == "tool_use"
+                    and message.tool_calls
+                    and self.cfg.settings.get("tools_enabled")
+                ):
+                    results = self._run_tools(message.tool_calls)
+                    if results is None:  # user aborted the whole turn
+                        return
+                    self.messages.extend(results)
+                    continue
+                return
 
-        # Hit the tool-call ceiling: force a final wrap-up instead of a bare exit
-        # that leaves the user with a half-finished, possibly broken state.
-        self.console.print("[yellow]Reached the tool-call limit — summarizing.[/yellow]")
-        self.messages.append(
-            Message(
-                role="user",
-                content="You've reached the tool-call limit and cannot call more "
-                "tools. In 2-4 sentences, summarize what you changed, what "
-                "currently works, and what is still broken or unfinished.",
+            # Hit the tool-call ceiling: force a final wrap-up instead of a bare
+            # exit that leaves a half-finished, possibly broken state.
+            self.console.print("[yellow]Reached the tool-call limit — summarizing.[/yellow]")
+            self.messages.append(
+                Message(
+                    role="user",
+                    content="You've reached the tool-call limit and cannot call more "
+                    "tools. In 2-4 sentences, summarize what you changed, what "
+                    "currently works, and what is still broken or unfinished.",
+                )
             )
-        )
-        message, _ = self._stream_once(provider, force_no_tools=True)
-        if message is not None:
-            self.messages.append(message)
+            message, _ = self._stream_once(provider, force_no_tools=True)
+            if message is not None:
+                self.messages.append(message)
+        except KeyboardInterrupt:
+            self.renderer.stop_all()
+            self.console.print("\n[yellow]⏹ interrupted[/yellow]")
+        except Exception as e:  # noqa: BLE001 - a bad turn must never crash the session
+            self.renderer.stop_all()
+            self.console.print(f"[red]Unexpected error:[/red] {e}")
+            self.console.print(
+                "[dim]The session is intact — your conversation is preserved.[/dim]"
+            )
 
     def _stream_once(self, provider: Provider, force_no_tools: bool = False):
         use_tools = self.cfg.settings.get("tools_enabled") and not force_no_tools
@@ -250,14 +269,23 @@ class App:
             summary = describe_call(call.name, call.arguments)
             self.renderer.tool_call(summary)
             if tool is None:
-                results.append(
-                    Message(
-                        role="tool",
-                        content=f"Error: unknown tool '{call.name}'",
-                        tool_call_id=call.id,
-                        name=call.name,
-                    )
-                )
+                results.append(self._tool_error(call, f"Error: unknown tool '{call.name}'"))
+                continue
+            # Validate required args before dispatch — a malformed call returns a
+            # correctable error to the model instead of raising into the handler.
+            missing = missing_required_args(tool, call.arguments)
+            if missing:
+                results.append(self._tool_error(
+                    call, f"Error: missing required argument(s): {', '.join(missing)}. "
+                    "Provide them and retry."
+                ))
+                continue
+            # Escalating loop-guard: nudge on the 2nd identical command, refuse the
+            # 3rd — a warning alone let the model keep thrashing and give up red.
+            guard = self._guard_tool_call(call)
+            if guard is not None and guard[0] == "refuse":
+                self.renderer.nudge(guard[1])
+                results.append(self._tool_error(call, f"[nexais] {guard[1]}"))
                 continue
             if tool.dangerous and not self.auto_approve and call.name not in self.approved_tools:
                 decision = self._confirm(summary)
@@ -265,14 +293,7 @@ class App:
                     self.console.print("[yellow]Aborted.[/yellow]")
                     return None
                 if decision == "deny":
-                    results.append(
-                        Message(
-                            role="tool",
-                            content="User denied this tool call.",
-                            tool_call_id=call.id,
-                            name=call.name,
-                        )
-                    )
+                    results.append(self._tool_error(call, "User denied this tool call."))
                     continue
                 if decision == "always":
                     self.approved_tools.add(call.name)
@@ -283,35 +304,40 @@ class App:
                 output = f"Error executing tool: {e}"
             self.renderer.stop_status()
             self.renderer.tool_result(output)
-            nudge = self._loop_nudge(call)
-            if nudge:
-                output = f"{output}\n\n[nexais] {nudge}"
-                self.renderer.nudge(nudge)
+            if guard is not None and guard[0] == "nudge":
+                output = f"{output}\n\n[nexais] {guard[1]}"
+                self.renderer.nudge(guard[1])
             results.append(
                 Message(role="tool", content=output, tool_call_id=call.id, name=call.name)
             )
         return results
 
-    def _loop_nudge(self, call) -> str | None:
-        """Detect thrashing (repeating a failing command or re-editing the same
-        file) and return a nudge to inject into the tool result."""
+    def _tool_error(self, call, content: str) -> Message:
+        return Message(role="tool", content=content, tool_call_id=call.id, name=call.name)
+
+    def _guard_tool_call(self, call) -> tuple[str, str] | None:
+        """Detect thrashing. Returns ("nudge"|"refuse", message) or None."""
         args = call.arguments or {}
         if call.name == "run_bash":
             cmd = args.get("command", "")
             self._cmd_counts[cmd] = self._cmd_counts.get(cmd, 0) + 1
-            if self._cmd_counts[cmd] >= 2:
-                return (
-                    f"You have run this exact command {self._cmd_counts[cmd]} times. "
-                    "Stop repeating it — re-read the relevant file and change your approach."
-                )
+            n = self._cmd_counts[cmd]
+            if n >= 3:
+                return ("refuse",
+                        "You have already run this exact command twice with the same "
+                        "result. I won't run it a third time — re-read the relevant file, "
+                        "state why it is failing, and change your approach.")
+            if n == 2:
+                return ("nudge",
+                        "You've run this exact command twice. If it failed the same way, "
+                        "stop repeating it — re-read the file and change your approach.")
         elif call.name == "edit_file":
             path = args.get("path", "")
             self._edit_counts[path] = self._edit_counts.get(path, 0) + 1
             if self._edit_counts[path] >= 3:
-                return (
-                    f"You've edited {path} {self._edit_counts[path]} times. Re-read the "
-                    "whole file, then rewrite it in one write_file call instead of more edits."
-                )
+                return ("nudge",
+                        f"You've edited {path} {self._edit_counts[path]} times. Re-read the "
+                        "whole file, then rewrite it in one write_file call instead of more edits.")
         return None
 
     def _confirm(self, summary: str) -> str:
@@ -964,14 +990,24 @@ def repl(app: App) -> None:
         if not line:
             continue
         if line.startswith("/"):
-            if not app.handle_command(line):
+            try:
+                cont = app.handle_command(line)
+            except Exception as e:  # noqa: BLE001 - a bad command must not crash the REPL
+                app.renderer.stop_all()
+                console.print(f"[red]Command error:[/red] {e}")
+                continue
+            if not cont:
                 console.print("[dim]bye[/dim]")
                 break
             continue
         try:
             app.run_turn(line)
         except KeyboardInterrupt:
+            app.renderer.stop_all()
             console.print("\n[yellow]⏹ interrupted[/yellow]")
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; never kill the REPL
+            app.renderer.stop_all()
+            console.print(f"[red]Unexpected error:[/red] {e}")
 
 
 def main(argv: list[str] | None = None) -> int:

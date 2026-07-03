@@ -167,6 +167,14 @@ file after a failed edit instead of guessing twice, and finish with a one-line s
 prints its token usage (`↳ N in / N out`), and if a run hits the tool-call ceiling it
 forces a final summary of what's done and what's still broken.
 
+**Guardrails.** `run_bash` refuses obviously catastrophic commands (`rm -rf /`, fork
+bombs, `mkfs`, `dd` to a device) and runs everything under a **disk sentinel** — if free
+space falls below a floor (default 500 MB, `NEXAIS_MIN_FREE_MB`), the command's whole
+process tree is killed before it can fill the disk. Repeating the same failing command is
+refused on the third try. Malformed tool calls return a correctable error instead of
+crashing, and an unexpected error in a turn is reported with the conversation preserved —
+never a hard crash.
+
 ## Memory across runs
 
 Each `nexai -p` is a fresh conversation by default. Two mechanisms carry context forward:
