@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nexais"
+name = "goldcomb"
 version = "0.1.0"
 description = "A Claude-Code-style terminal AI agent that works with any provider — configure and switch models with slash commands."
 readme = "README.md"
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nexais = "nexais.cli:main"
+goldcomb = "goldcomb.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["nexais"]
+packages = ["goldcomb"]
