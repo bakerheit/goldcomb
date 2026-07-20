@@ -311,6 +311,7 @@ def serve(cfg: Config, *, sudo: bool = False) -> int:
             "cwd": str(Path.cwd()),
             "provider": cfg.current_provider,
             "model": cfg.current_model,
+            "config_revision": cfg.config_revision,
             "providers": {
                 name: {
                     "type": entry.get("type", ""),

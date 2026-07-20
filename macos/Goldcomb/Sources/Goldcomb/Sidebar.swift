@@ -214,6 +214,14 @@ struct AgentSidebarRow: View {
                             .background(.orange.opacity(0.16), in: Capsule())
                             .foregroundStyle(.orange)
                     }
+                    if session.hasStaleConfig {
+                        Text("restart")
+                            .font(.system(size: 9, weight: .bold))
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(.yellow.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.orange)
+                            .help("Provider settings changed; restart this agent to apply them")
+                    }
                 }
                 Text(subtitle)
                     .font(.caption2)

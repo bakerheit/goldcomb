@@ -30,8 +30,38 @@ enum AppSettings {
         return "\(home)/workspace/goldcomb/.venv/bin/python -m goldcomb"
     }
 
+    struct CommandInvocation {
+        let executable: String
+        let arguments: [String]
+    }
+
+    /// Parse a shell-like command without invoking a shell. Quoted paths keep
+    /// spaces intact and Process receives an explicit executable/argv array.
+    static func commandInvocation() throws -> CommandInvocation {
+        var parts: [String] = [], current = "", quote: Character?
+        var escaped = false
+        for char in command {
+            if escaped { current.append(char); escaped = false; continue }
+            if char == "\\" { escaped = true; continue }
+            if let active = quote {
+                if char == active { quote = nil } else { current.append(char) }
+            } else if char == "\"" || char == "'" {
+                quote = char
+            } else if char.isWhitespace {
+                if !current.isEmpty { parts.append(current); current = "" }
+            } else { current.append(char) }
+        }
+        if quote != nil { throw NSError(domain: "GoldcombSettings", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Unclosed quote in agent command"] ) }
+        if !current.isEmpty { parts.append(current) }
+        guard let executable = parts.first else { throw NSError(domain: "GoldcombSettings", code: 2,
+            userInfo: [NSLocalizedDescriptionKey: "No Goldcomb command configured"]) }
+        return CommandInvocation(executable: executable, arguments: Array(parts.dropFirst()))
+    }
+
     static func commandParts() -> [String] {
-        command.split(separator: " ").map(String.init)
+        guard let invocation = try? commandInvocation() else { return [] }
+        return [invocation.executable] + invocation.arguments
     }
 }
 

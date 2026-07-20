@@ -89,6 +89,11 @@ final class AgentSession: ObservableObject, Identifiable {
     @Published var provider: String = "…"
     @Published var model: String = "…"
     @Published var knownProviders: [String: [String]] = [:]  // name → cached models
+    @Published var readyConfigRevision = 0
+    @Published var currentConfigRevision = 0
+    var hasStaleConfig: Bool {
+        isAlive && currentConfigRevision > 0 && readyConfigRevision != currentConfigRevision
+    }
     @Published var sudo: Bool
     @Published var sessionIn = 0
     @Published var sessionOut = 0
@@ -130,6 +135,10 @@ final class AgentSession: ObservableObject, Identifiable {
         self.personaRole = personaRole
         self.role = role.trimmingCharacters(in: .whitespacesAndNewlines)
         self.description = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        NotificationCenter.default.addObserver(forName: .configRevisionChanged, object: nil,
+                                                queue: .main) { [weak self] note in
+            if let revision = note.object as? Int { self?.currentConfigRevision = revision }
+        }
     }
 
     // MARK: - process lifecycle
@@ -398,6 +407,8 @@ final class AgentSession: ObservableObject, Identifiable {
         case "ready":
             provider = event["provider"] as? String ?? "?"
             model = event["model"] as? String ?? "?"
+            readyConfigRevision = event["config_revision"] as? Int ?? 0
+            currentConfigRevision = max(currentConfigRevision, readyConfigRevision)
             if let providers = event["providers"] as? [String: [String: Any]] {
                 knownProviders = providers.mapValues { ($0["models"] as? [String]) ?? [] }
             }

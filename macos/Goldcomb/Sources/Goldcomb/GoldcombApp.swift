@@ -33,22 +33,26 @@ struct SettingsView: View {
     @State private var command = AppSettings.command
 
     var body: some View {
-        Form {
-            Section {
-                TextField("Agent command", text: $command)
-                    .font(.system(.body, design: .monospaced))
-                    .onSubmit { AppSettings.command = command }
-                Text("Executable + arguments used to start each agent; --serve is appended automatically. Applies to newly created agents.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Reset to default") {
-                    command = AppSettings.defaultCommand
-                    AppSettings.command = command
+        TabView {
+            Form {
+                Section {
+                    TextField("Agent command", text: $command)
+                        .font(.system(.body, design: .monospaced))
+                        .onSubmit { AppSettings.command = command }
+                    Text("Executable + arguments used to start each agent; --serve is appended automatically. Applies to newly created agents.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Reset to default") {
+                        command = AppSettings.defaultCommand
+                        AppSettings.command = command
+                    }
                 }
-            }
+            }.tabItem { Label("General", systemImage: "gear") }
+            ProvidersSettingsView()
+                .tabItem { Label("Providers", systemImage: "key") }
         }
         .padding(20)
-        .frame(width: 520)
+        .frame(width: 620, height: 460)
         .onDisappear { AppSettings.command = command }
     }
 }

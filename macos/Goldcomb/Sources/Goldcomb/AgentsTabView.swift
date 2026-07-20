@@ -244,7 +244,11 @@ private struct AgentNodeCard: View {
                 if agent.sudo {
                     badge("sudo", .red)
                 }
-                if agent.role.isEmpty && !agent.sudo {
+                if agent.hasStaleConfig {
+                    badge("restart", .orange)
+                        .help("Provider settings changed; restart this agent to apply them")
+                }
+                if agent.role.isEmpty && !agent.sudo && !agent.hasStaleConfig {
                     Text(agent.personaRole ?? "worker")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)

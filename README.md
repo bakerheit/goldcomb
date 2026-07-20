@@ -122,6 +122,28 @@ Other provider commands:
 /provider remove <name>              delete a provider
 ```
 
+### Scriptable provider configuration
+
+The one-shot management interface is intended for native clients and automation. Reads are
+JSON-only and never include API-key material:
+
+```bash
+goldcomb config list --json
+goldcomb config add --json --name work --type openai \
+  --default-model gpt-4o --api-key-stdin < key.txt
+goldcomb config update --json --name work --new-name office \
+  --type openai --default-model gpt-4.1 --current
+echo "$OPENAI_API_KEY" | goldcomb config update --json --name office --api-key-stdin
+```
+
+Keys are accepted only from standard input with `--api-key-stdin`, never as command-line
+arguments (which can be visible to other processes). List and mutation responses omit
+`api_key` entirely and report only `has_key` plus `key_source` (`config`, `env`, or `none`).
+Provider names must match `[a-z0-9-]+`; types are `anthropic`, `openai`, `gemini`, or
+`openai-compatible`. Remote base URLs must use HTTPS; HTTP is accepted only for local
+endpoints. `openai-compatible` providers require a base URL. The config is locked during
+updates, replaced atomically, and kept mode `0600` because it may contain secrets.
+
 ## Switch models with a slash command
 
 ```
@@ -363,7 +385,12 @@ swift run            # or: open Package.swift in Xcode and hit Run
 
 The command used to start each agent defaults to this repo's virtualenv
 (`~/workspace/goldcomb/.venv/bin/python -m goldcomb`) and can be changed in the app's
-Settings.
+Settings. The **Providers** Settings tab lists, adds, and edits shared providers through
+the one-shot Python interface; the Swift app never reads or rewrites `config.json`.
+Existing keys are never displayed, and replacement keys are sent only over a private
+stdin pipe, not in process arguments or logs. Provider changes apply to newly launched
+agents. Any running agent whose startup config revision differs gets a **restart** badge
+in the sidebar and Agents view; restart that agent to load the changed provider config.
 
 ## Headless serve mode
 

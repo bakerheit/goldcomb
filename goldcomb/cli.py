@@ -1808,6 +1808,11 @@ def repl(app: App, cont: bool = False, resume: str | None = None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    effective_argv = list(argv) if argv is not None else sys.argv[1:]
+    if effective_argv and effective_argv[0] == "config":
+        from .config_cli import run as run_config
+        return run_config(effective_argv[1:])
+
     parser = argparse.ArgumentParser(
         prog="goldcomb",
         description="A provider-agnostic, Claude-Code-style terminal AI agent.",
