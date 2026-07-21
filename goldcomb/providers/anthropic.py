@@ -96,7 +96,16 @@ class AnthropicProvider(Provider):
             "content-type": "application/json",
             "anthropic-version": self.config.get("anthropic_version", ANTHROPIC_VERSION),
         }
-        if self.api_key:
+        # Claude subscription (Pro/Max) via OAuth: a Bearer access token plus the
+        # oauth beta header, and NO x-api-key (the two are mutually exclusive —
+        # sending both is rejected). The fresh token is put on the config by the
+        # caller (App.get_provider refreshes before building the provider).
+        oauth_token = self.config.get("oauth_token")
+        if oauth_token:
+            from ..oauth import OAUTH_BETA
+            headers["authorization"] = f"Bearer {oauth_token}"
+            headers["anthropic-beta"] = OAUTH_BETA
+        elif self.api_key:
             headers["x-api-key"] = self.api_key
         headers.update(self.config.get("headers", {}))
         return headers

@@ -12,11 +12,24 @@ def test_planner_role_exists_and_is_board_shaped():
     assert "do NOT implement" in prompt
 
 
-def test_role_prompt_lookup_is_forgiving():
+def test_known_roles_yield_their_rich_persona():
+    # Case/space-insensitive; planner and advisor keep their built-in blocks.
     assert role_prompt(" Planner ") == ROLES["planner"]
-    assert role_prompt("unknown") is None
+    assert role_prompt("advisor") == ROLES["advisor"]
+
+
+def test_free_text_role_is_injected_as_is():
+    # Any other non-empty text is a free-text role description (the unified
+    # role field), used verbatim — not rejected.
+    block = role_prompt("Backend engineer")
+    assert block is not None
+    assert "Backend engineer" in block
+
+
+def test_empty_role_yields_no_block():
     assert role_prompt(None) is None
     assert role_prompt("") is None
+    assert role_prompt("   ") is None
 
 
 def test_team_context_block_in_system_prompt():

@@ -284,7 +284,7 @@ struct SprintTabView: View {
     /// project; the quick actions message it and jump to its chat.
     private var plannerSession: AgentSession? {
         let mine = store.sessions.filter { candidate in
-            candidate.personaRole == "planner" &&
+            candidate.role.lowercased() == "planner" &&
             (session.projectID != nil
                 ? candidate.projectID == session.projectID
                 : candidate.directory == session.directory)
@@ -296,7 +296,7 @@ struct SprintTabView: View {
     /// advisor`) that tracks costs, budgets, and accounting setup.
     private var advisorSession: AgentSession? {
         let mine = store.sessions.filter { candidate in
-            candidate.personaRole == "advisor" &&
+            candidate.role.lowercased() == "advisor" &&
             (session.projectID != nil
                 ? candidate.projectID == session.projectID
                 : candidate.directory == session.directory)
@@ -348,7 +348,7 @@ struct SprintTabView: View {
                         name: Names.random(
                             avoiding: Set(store.sessions.map(\.name))),
                         directory: session.directory,
-                        sudo: false, personaRole: "planner",
+                        sudo: false, role: "planner",
                         in: project)
                 }
                 .help("A scrum-master agent that owns this board: grooming, "
@@ -394,7 +394,7 @@ struct SprintTabView: View {
                         name: Names.random(
                             avoiding: Set(store.sessions.map(\.name))),
                         directory: session.directory,
-                        sudo: false, personaRole: "advisor",
+                        sudo: false, role: "advisor",
                         in: project)
                 }
                 .help("A finance/business agent that tracks project costs, "

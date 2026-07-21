@@ -99,25 +99,25 @@ struct SavedAgent: Codable {
     var name: String
     var directory: String  // absolute path (the agent's cwd)
     var sudo: Bool = false
-    var role: String = ""          // display metadata, not CLI persona
+    var role: String = ""          // unified free-text role (see migration below)
     var description: String = ""
-    var personaRole: String? = nil
     var provider: String? = nil  // last used, if the process reported it
     var model: String? = nil
     var projectID: UUID? = nil   // nil = ungrouped
     var parentID: UUID? = nil    // agent-tree parent (Agents tab); nil = root
 
     private enum CodingKeys: String, CodingKey {
+        // `personaRole` is read for migration only; never written back.
         case id, name, directory, sudo, role, description, personaRole
         case provider, model, projectID, parentID
     }
 
     init(id: UUID, name: String, directory: String, sudo: Bool = false,
-         role: String = "", description: String = "", personaRole: String? = nil,
+         role: String = "", description: String = "",
          provider: String? = nil, model: String? = nil,
          projectID: UUID? = nil, parentID: UUID? = nil) {
         self.id = id; self.name = name; self.directory = directory; self.sudo = sudo
-        self.role = role; self.description = description; self.personaRole = personaRole
+        self.role = role; self.description = description
         self.provider = provider; self.model = model
         self.projectID = projectID; self.parentID = parentID
     }
@@ -133,14 +133,29 @@ struct SavedAgent: Codable {
         model = try c.decodeIfPresent(String.self, forKey: .model)
         projectID = try c.decodeIfPresent(UUID.self, forKey: .projectID)
         parentID = try c.decodeIfPresent(UUID.self, forKey: .parentID)
-        if c.contains(.personaRole) {
-            personaRole = try c.decodeIfPresent(String.self, forKey: .personaRole)
-            role = try c.decodeIfPresent(String.self, forKey: .role) ?? ""
-        } else {
-            // Before display roles existed, `role` exclusively meant persona.
-            personaRole = try c.decodeIfPresent(String.self, forKey: .role)
-            role = ""
-        }
+        // Migration: role and persona are now one free-text field. Prefer the
+        // free-text display role; fall back to the old persona (planner/advisor
+        // still resolve to their rich block via the CLI). "worker" was the
+        // no-op default persona, so it maps to no role.
+        let savedRole = try c.decodeIfPresent(String.self, forKey: .role) ?? ""
+        var persona = try c.decodeIfPresent(String.self, forKey: .personaRole) ?? ""
+        if persona == "worker" { persona = "" }
+        role = savedRole.isEmpty ? persona : savedRole
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(directory, forKey: .directory)
+        try c.encode(sudo, forKey: .sudo)
+        try c.encode(role, forKey: .role)
+        try c.encode(description, forKey: .description)
+        try c.encodeIfPresent(provider, forKey: .provider)
+        try c.encodeIfPresent(model, forKey: .model)
+        try c.encodeIfPresent(projectID, forKey: .projectID)
+        try c.encodeIfPresent(parentID, forKey: .parentID)
+        // personaRole is intentionally not written — it's unified into role.
     }
 }
 
@@ -471,7 +486,6 @@ final class SessionStore: ObservableObject {
                                        directory: $0.directory.path,
                                        sudo: $0.sudoAtLaunch, role: $0.role,
                                        description: $0.description,
-                                       personaRole: $0.personaRole,
                                        projectID: $0.projectID,
                                        parentID: $0.parentID)
                 // Persist the user-chosen DEFAULT (Agents tab), not the live
@@ -556,7 +570,6 @@ final class SessionStore: ObservableObject {
                 name: saved.name,
                 directory: URL(fileURLWithPath: saved.directory),
                 sudo: saved.sudo,
-                personaRole: saved.personaRole,
                 role: saved.role,
                 description: saved.description,
                 defaultProvider: saved.provider,
@@ -613,7 +626,6 @@ final class SessionStore: ObservableObject {
 
     @discardableResult
     func createSession(name: String, directory: URL, sudo: Bool,
-                       personaRole: String? = nil,
                        role: String = "", description: String = "",
                        parentID: UUID? = nil,
                        select: Bool = true,
@@ -623,7 +635,6 @@ final class SessionStore: ObservableObject {
             name: n.isEmpty ? Names.random(avoiding: Set(sessions.map(\.name))) : n,
             directory: directory,
             sudo: sudo,
-            personaRole: personaRole,
             role: role,
             description: description
         )

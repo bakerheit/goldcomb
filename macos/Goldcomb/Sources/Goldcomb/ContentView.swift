@@ -486,7 +486,7 @@ struct NewSessionSheet: View {
                 }
                 .help("Roll a different name")
             }
-            TextField("Display role (optional)", text: $role)
+            TextField("Role (e.g. Backend engineer)", text: $role)
             TextField("Description (optional)", text: $agentDescription, axis: .vertical)
                 .lineLimit(2...4)
             if let project {

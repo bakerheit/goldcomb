@@ -1,9 +1,12 @@
-"""Named agent roles: reusable personas appended to the system prompt.
+"""Agent role: a free-text description of what this agent does, appended to the
+system prompt.
 
-A role shapes *how* an agent works, not what it can do — the tool set is
-unchanged. Select one with ``goldcomb --role planner`` (the macOS app passes it
-when creating a role-bound agent). Unknown names are ignored with a warning so
-a stale launcher never blocks a session.
+``--role`` is now a single free-text field (the app's Agents tab exposes it as
+"Role"). Any text is injected as a short role description. A handful of names
+still carry a rich built-in persona — ``planner`` (the Tickets-board scrum
+master) and ``advisor`` (the financial advisor) — so those keep their detailed
+behavior; everything else is used verbatim. A role shapes *how* an agent works,
+not what it can do — the tool set is unchanged.
 """
 
 from __future__ import annotations
@@ -107,7 +110,15 @@ Working style:
 
 
 def role_prompt(name: str | None) -> str | None:
-    """The system-prompt block for a role, or None (unknown/empty names)."""
+    """The system-prompt block for a role. A known role name (``planner`` /
+    ``advisor``) yields its rich built-in persona; any other non-empty text is a
+    free-text role description, injected as-is. Empty/None → None."""
     if not name:
         return None
-    return ROLES.get(name.strip().lower())
+    role = name.strip()
+    if not role:
+        return None
+    known = ROLES.get(role.lower())
+    if known:
+        return known
+    return f"Your role on this team: {role}"
