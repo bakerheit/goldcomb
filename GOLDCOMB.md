@@ -14,6 +14,7 @@ Installed command is `goldcomb` (see install.sh); package/entry is `goldcomb` (`
 - `goldcomb/cli.py` (~1300 lines) — REPL, agentic tool loop, slash commands (`cmd_*` dispatch, `COMMANDS` list).
 - `goldcomb/providers/` — one adapter per API (anthropic, openai, gemini, base); normalized Message/Event model. New provider = one file + registry entry.
 - `goldcomb/tools.py` — built-in tools (read_file, write_file, edit_file, list_dir, run_bash) + guardrails (catastrophic-command regexes, disk-free sentinel MIN_FREE_MB).
+- `goldcomb/git_tools.py` — read-only, structured git tools (git_status/git_diff/git_log/git_branch; argv-only, 15s timeout, clean `{error}` dicts for git-missing/not-a-repo/empty-repo, 30k-char truncation). Agent-facing wrappers in `tools.py`; the `--serve` NDJSON `git_status` command (see `server.py`) emits a `git_status` event `{branch,ahead,behind,files}` (or an `error` event).
 - `goldcomb/roles.py` — `--role` personas: `planner` (Tickets-board steward) and `advisor` (per-project financial advisor: cost/budget tracking, `.ai/finance/ledger.md` ledger, accounting setup help).
 - `goldcomb/config.py` — persistent config at `~/.config/goldcomb/config.json` (0600), env-var key fallback.
 - `goldcomb/threads.py` — autosaved session threads per project dir; `-c` / `-r` resume. Canonical store is `<config_dir>/projects/<cwd-key>/threads/` (full-fidelity JSON). Every save is also exported (best-effort) in a vendor-neutral interchange format at `<cwd>/.ai/threads/<id>.jsonl` (header line + `{"role","content"}` per line, `agent` field in header; a README.md there documents the format). Threads other tools write into `.ai/threads/` (agent != "goldcomb") are adopted into the canonical store on list/load — import is once-only (existing canonical id = skip). Deletes never prune the export.
@@ -73,6 +74,144 @@ Installed command is `goldcomb` (see install.sh); package/entry is `goldcomb` (`
   (current thread excluded).
 - `/memory` prints the agent's file. Both tools always available (not
   scrum-gated); registered in tools.py next to `_scrum_run`.
+
+## Group-chat @-tagging & composer (2026-07-20)
+- `@name` tags an agent as the *expected* responder without silencing the room.
+  Semantics live in `ChatRoom.addresses`/`expects`/`taggedAgents`: an agent
+  message stays targeted (naming someone wakes only them; an untagged agent
+  remark wakes nobody — anti-ping-pong), but a **user** post always broadcasts
+  (the user's floor), so a tagged user post wakes the tagged agent AND the
+  others — the tag sets expectation, not exclusivity. The broker digest
+  (`SessionStore.chatDigest`) frames it three ways: tagged → "a reply is
+  expected"; untagged-but-someone-else-tagged → "chime in only if you have
+  something specific"; open broadcast → "respond if you have something to add".
+  Cost note: a tagged user post wakes all agents (bounded by the unattended cap
+  + the decline-if-nothing digest), which is the tradeoff for "others may chime
+  in".
+- Composer parity: `ChatRoomView`'s composer gains inline `@`-mention
+  autocomplete — typing `@` opens a popup that filters agents as you type
+  (`MentionAutocomplete`: pure trigger/filter/apply logic, prefix-first
+  substring search; Return picks the top, click picks any), plus a discovery
+  button and a live "expecting a reply from …" hint, alongside the existing
+  attach. What autocomplete inserts (`@Given `) is exactly what the broker
+  matches. Session-only controls from the single-agent chat (model picker,
+  /compact, /clear, sudo, new-conversation) don't apply to a multi-agent room
+  and are intentionally omitted.
+
+## Deployed agents → roster & config (2026-07-20)
+- **Persist (Swift).** `promoteDeploys` dropped its 20-minute age window: every
+  deployed worker (`deploy_agent`) becomes a permanent, configurable roster
+  member parented under its deployer — a deploy run hours ago still joins the
+  Agents tab. Once promoted it persists; the user removes it explicitly, and
+  `declinedPromotions` is now persisted to UserDefaults so a removed agent
+  doesn't resurrect from its lingering on-disk record on the next launch.
+- **Govern (Python bridge).** The app publishes each project's per-agent default
+  models to `<project>/.ai/agents/agent-config.json`
+  (`SessionStore.writeAgentConfigs`, keyed by agent name, written alongside the
+  sidebar state). The deploy flow consults it: `agents.configured_default(name)`
+  reads that file, and `cli._run_subagent` uses the configured model when the
+  deploying agent didn't pin one — so a lead deploying a pre-configured agent
+  runs it on the model the user chose. Matches the full human name, falling back
+  to the bare `(label)`.
+- The loop: deploy once → it joins the roster → configure its default model in
+  the config sheet → subsequent deploys of that label honor it. An explicit
+  `provider`/`model` on the deploy call still wins over the config.
+
+## Agent config sheet (2026-07-20)
+- Clicking an agent card in the Agents tab opens `AgentConfigSheet` (its
+  settings), not a chat — chat now lives on the card's message icon and the
+  context menu's "Open chat". The sheet shows read-only identity (name, persona,
+  live model, folder) and edits: display **role** + **description** (app-side
+  metadata, now `@Published var` on AgentSession, live via
+  `SessionStore.updateAgentMetadata` — never passed to the process, so no
+  restart), **default model** (the picker moved here from the card context
+  menu), and **sudo** (live toggle). "Open chat" in the sheet routes to the
+  agent's chat.
+
+## Per-agent default model (2026-07-20)
+- An agent can have a user-chosen default model, set from the Agents tab (card
+  context menu → "Default model") or promoted from the chat model chip ("Set …
+  as default"). Stored on `AgentSession.defaultProvider/defaultModel`, persisted
+  via `SavedAgent.provider/model` (repurposed from the old "last used" — a live
+  chip change no longer persists as the default).
+- `AgentSession.serveArguments` passes it as `--provider`/`--model` at launch
+  (the CLI's `--serve` already honors those, in-memory), so the agent runs on
+  its own model whenever its process starts — including when woken for a group
+  chat or delegated to — not just when the user opens its chat. No default →
+  inherit the app's global model. `SessionStore.setAgentDefaultModel` persists
+  it and applies it live (`use`) if the agent is running.
+- Live chip changes stay per-session (in-memory `use`), distinct from the
+  default. Scope note: the in-process `deploy_agent` worker (a lead choosing a
+  model for an ephemeral labelled worker) is NOT covered — this is about
+  app-launched agent sessions, which is what group chat and chat-based
+  delegation use.
+
+## Chat scroll-to-bottom on open (2026-07-20)
+- ChatView's transcript only scrolled to the newest message `.onChange` of the
+  transcript count/last text — which don't fire for a transcript that's already
+  populated when the view appears (switching agents, or after a resume hydrates
+  history), so it opened at the first message. Added `.onAppear` →
+  `scrollToEnd(animated:false)` (deferred one runloop tick so the LazyVStack has
+  laid out its rows). The `.onChange` handlers now share the same helper.
+  ChatRoomView already scrolled on appear (jump-to-first-unread).
+
+## History popover load fix (2026-07-20)
+- The ChatView history popover loaded its thread list in the History button's
+  action — the same render cycle that flipped `showHistory`, so the popover's
+  first presentation raced the `@State` update and came up empty; it only
+  filled on a second open. Moved the load into a `reloadHistory()` helper called
+  from the popover's `.onAppear` (kept in the button action too, so the common
+  case has no flash). Fires each open, so newly saved conversations show up. The
+  ProjectView thread list already used the correct `.onAppear`/`.onReceive`
+  pattern.
+
+## Markdown rendering in chat (2026-07-20)
+- Agent messages are full of Markdown (headings, lists, bold, quotes, fenced
+  code). SwiftUI's `AttributedString(markdown:)` only does *inline* syntax, so
+  block elements came through raw. `MarkdownText.swift` adds a line-oriented
+  block parser (`Markdown.parse → [MarkdownBlock]`, pure/tested) and a
+  `MarkdownMessage` view that renders headings, ordered lists (source numbers
+  preserved), bullet lists, blockquotes, fenced code, and rules — inline syntax
+  within each block still goes through `AttributedString(markdown:)`.
+- Used by both the single-agent transcript (`ChatView` assistant rows) and the
+  group-chat bubbles (`ChatRoomView`). Ticket-id links and the @user highlight
+  (NEXA-84/70) survive via `ChatLinkRouter.decorate`, an attribute-only overlay
+  applied on top of the Markdown-parsed runs (range-mapped by character
+  distance, so it composes without disturbing bold/italic/code). The old
+  word-by-word `ChatLinkRouter.attributed` now delegates to `decorate`.
+
+## Model picker & live catalog (2026-07-20)
+- The serve `ready` event's per-provider `models` uses `_models_for` =
+  `cached or default_models_for(type)` (server.py), so a freshly-added provider
+  surfaces its built-in model list instead of an empty one that renders as just
+  "default model" in the app's picker. Mirrors the CLI's fallback.
+- A `models` serve command live-fetches a provider's full catalog
+  (`provider.list_models()`), caches it, and replies with a `models` event
+  `{provider,models,ok,error?}` — a fetch failure still returns the built-in
+  list. The app's model chip has a "Refresh from API" action per provider
+  (`AgentSession.refreshModels`) that drives it; the reply updates
+  `knownProviders`. Without this the app only ever had the built-in list from
+  the ready event.
+
+## Slash commands & /compact (2026-07-20)
+- The macOS composer (`ChatView`) has slash commands (`SlashCommands.swift`):
+  type `/name` (palette suggests as you type) or use the `slash.circle` menu.
+  Each maps to an existing `AgentSession` command so app and CLI stay in step;
+  zero-argument by design. Current set: `/compact`, `/clear`, `/sudo`.
+  `SlashCommands.match` runs a bare `/name`; a line with a space is a message,
+  never a command.
+- `/compact` summarizes the conversation and continues from the summary — the
+  same context-cost lever as the group-chat work, but user-driven. CLI
+  `App.compact_conversation` makes one no-tools provider call
+  (`COMPACT_SYSTEM`), then replaces history with a single user message
+  (`COMPACT_PREFIX` + summary); the thread is kept (unlike `/clear`), so the
+  next autosave writes the compacted history. Guards: needs ≥4 messages, and an
+  empty summary leaves history untouched. Serve wiring: a `compact` command in
+  `server.py` → a `compacted` event `{ok,before,after,reason}`; the app resets
+  `isRunning` and logs the outcome (the compact command is not a turn, so
+  nothing else clears the spinner). The summarization call itself costs tokens
+  (full transcript in), so it pays off only once a conversation is long enough
+  that future turns would re-send that history many times.
 
 ## Agent chats & attachments (NEXA-64, 2026-07-20)
 - Rooms are append-only JSONL at `.ai/chats/<id>.jsonl` (`goldcomb/chats.py`

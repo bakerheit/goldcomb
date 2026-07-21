@@ -56,9 +56,28 @@ from . import threads
 
 COMMANDS = [
     "help", "setup", "provider", "use", "model", "models", "system", "tools",
-    "sudo", "render", "set", "theme", "scrum", "tickets", "memory", "clear", "history", "save",
-    "load", "config", "exit", "threads", "resume", "new",
+    "sudo", "render", "set", "theme", "scrum", "tickets", "memory", "clear",
+    "compact", "history", "save", "load", "config", "exit", "threads",
+    "resume", "new",
 ]
+
+#: System prompt for the one-off summarization call behind /compact. The goal
+#: is a hand-off note dense enough that the conversation can continue with the
+#: original history dropped — so it keeps decisions and their reasons, current
+#: state, and open threads, not a play-by-play.
+COMPACT_SYSTEM = """\
+You are compacting a long agent conversation so it can continue with far less \
+context. Read the transcript and write a dense summary that a fresh instance \
+could pick up from without the original. Preserve: what the user is trying to \
+accomplish; decisions made and why; the current state (what's done, what \
+works, what's broken); concrete specifics still in play (file paths, commands, \
+values, identifiers); and open threads or agreed next steps. Drop pleasantries \
+and superseded detail. Write it as notes, not prose — terse and factual. Do \
+not ask questions or address the user; this is a note to the next instance."""
+
+#: Prepended to the summary so the model reads it as prior context, not a new
+#: request.
+COMPACT_PREFIX = "[Earlier conversation, compacted to a summary:]\n\n"
 
 MAX_TOOL_ITERATIONS = 30
 
@@ -92,6 +111,10 @@ Verify your work. After writing or changing code, run it or its tests. If a \
 command seems missing (e.g. pytest, pip), try alternatives before giving up: \
 `python3 -m pytest`, `python3 -m pip`, `pip3`, or a local virtualenv \
 (`.venv/bin/python`). Don't report success you haven't checked.
+
+Inspect git with the dedicated tools. For repo state use git_status, git_diff, \
+git_log, and git_branch (they return clean structured summaries and handle \
+edge cases) rather than run_bash("git ...").
 
 Editing rules. Read a file before you edit it. After an edit, if the next \
 command shows the SAME error, RE-READ the file to see its exact current \
@@ -225,10 +248,11 @@ class App:
                 "addressed to you are delivered into your turns automatically; "
                 "reply with chat post, or don't reply if you have nothing to "
                 "add.\n"
-                "Address teammates by name when you expect a reply ('Quill, "
-                "can you check X?'). Only the agents you name are woken — an "
-                "unaddressed post is left for the human to read, so a message "
-                "meant for someone must say who it is for."
+                "Tag the teammate you expect a reply from with @name ('@Quill "
+                "can you check X?'). A tagged agent is expected to answer; "
+                "others may still chime in if they have something to add. An "
+                "agent post that tags nobody is left for the human to read, so "
+                "say who it is for when you need a reply."
             )
         user_sys = self.cfg.settings.get("system_prompt")
         if user_sys:
@@ -567,9 +591,18 @@ class App:
         # labels become "Ines Vale (retry-worker)" so the board stays legible.
         from .names import humanize
         label = humanize(args.get("label"))
+        provider_arg, model_arg = args.get("provider"), args.get("model")
+        # Honor the user's pre-configured default model for this agent (set in
+        # the app's Agents tab) when the deploying agent didn't pin one — so a
+        # deployed agent runs on the model the user chose for it.
+        if not model_arg:
+            cfg_provider, cfg_model = agents.configured_default(label)
+            if cfg_model:
+                provider_arg = provider_arg or cfg_provider
+                model_arg = cfg_model
         try:
             pname, model = agents.resolve_target(
-                self.cfg, args.get("provider"), args.get("model")
+                self.cfg, provider_arg, model_arg
             )
         except ValueError as e:
             return f"Error: {e}"
@@ -744,6 +777,7 @@ class App:
             "tickets": self.cmd_scrum,
             "memory": self.cmd_memory,
             "clear": self.cmd_clear,
+            "compact": self.cmd_compact,
             "history": self.cmd_history,
             "save": self.cmd_save,
             "load": self.cmd_load,
@@ -1296,6 +1330,87 @@ class App:
         clear_viewport(self.console)
         self.console.print("[ok]Conversation cleared.[/ok]")
 
+    # -- compaction ----------------------------------------------------------
+
+    def _render_transcript(self, messages: list[Message]) -> str:
+        """The conversation as plain text for the summarizer. Tool calls and
+        results are folded in briefly so the summary knows what was done."""
+        lines: list[str] = []
+        for m in messages:
+            if m.role == "tool":
+                body = " ".join((m.content or "").split())
+                lines.append(f"[tool result] {body[:600]}")
+                continue
+            who = "user" if m.role == "user" else "assistant"
+            if m.content:
+                lines.append(f"{who}: {m.content}")
+            for call in m.tool_calls:
+                lines.append(f"[assistant called {call.name} {call.arguments}]")
+        return "\n".join(lines)
+
+    def compact_conversation(self, provider: Provider) -> dict:
+        """Summarize the conversation and replace history with the summary, so
+        the next turn carries the gist at a fraction of the tokens.
+
+        Returns a result dict — ``{ok, before, after}`` on success, or
+        ``{ok: False, reason}`` when there's nothing to compact or the summary
+        came back empty. Never raises for the "too short" / "empty" cases;
+        ProviderError propagates to the caller (both callers catch it).
+        """
+        original = list(self.messages)
+        # Below a couple of turns there's nothing to gain — the summary would
+        # cost more than it saves.
+        if len(original) < 4:
+            return {"ok": False, "reason": "too-short", "before": len(original)}
+        self.renderer.start_status("Compacting")
+        try:
+            request = [Message(role="user", content=self._render_transcript(original))]
+            completed: Completed | None = None
+            for ev in provider.stream(
+                request,
+                model=self.cfg.current_model or "",
+                system=COMPACT_SYSTEM,
+                tools=None,
+                max_tokens=int(self.cfg.settings.get("max_tokens") or 4096),
+                temperature=self.cfg.settings.get("temperature"),
+            ):
+                if isinstance(ev, Completed):
+                    completed = ev
+        finally:
+            self.renderer.stop_status()
+        summary = (completed.message.content if completed else "").strip()
+        if not summary:
+            return {"ok": False, "reason": "empty-summary", "before": len(original)}
+        if completed:
+            self._record_usage(completed.usage)
+        self.messages = [Message(role="user", content=COMPACT_PREFIX + summary)]
+        return {"ok": True, "before": len(original), "after": len(self.messages),
+                "summary": summary}
+
+    def cmd_compact(self, args) -> None:
+        try:
+            provider = self.get_provider()
+        except ProviderError as e:
+            self.console.print(f"[err]{escape(str(e))}[/err]")
+            return
+        try:
+            result = self.compact_conversation(provider)
+        except ProviderError as e:
+            self.console.print(f"[err]Compaction failed:[/err] {escape(str(e))}")
+            return
+        if not result["ok"]:
+            if result["reason"] == "too-short":
+                self.console.print(
+                    "[dim]Nothing to compact yet — the conversation is short.[/dim]")
+            else:
+                self.console.print(
+                    "[warn]Compaction produced no summary; history unchanged.[/warn]")
+            return
+        self._autosave()
+        self.console.print(
+            f"[ok]Compacted[/ok] {result['before']} messages → a summary "
+            f"([dim]saved; the conversation continues from here[/dim])")
+
     def cmd_history(self, args) -> None:
         self.console.print(f"[dim]{len(self.messages)} messages in this conversation[/dim]")
         role_styles = {"user": "accent2", "assistant": "accent", "tool": "dim"}
@@ -1456,6 +1571,7 @@ HELP_TEXT = r"""[bold]goldcomb commands[/bold]
 [heading]Conversation[/heading]
   [cmd]/system[/cmd] \[prompt|clear]                 show/set system prompt
   [cmd]/clear[/cmd]                                 reset the conversation
+  [cmd]/compact[/cmd]                               summarize history to shrink context
   [cmd]/history[/cmd]                               list messages so far
   [cmd]/save[/cmd] \[path] · [cmd]/load[/cmd] \[path]          export/import a session file
 
@@ -1674,6 +1790,7 @@ def _build_prompt_session(app: App):
             "/theme": {name: None for name in THEMES},
             "/scrum": {"on": None, "off": None, "show": None},
             "/clear": None,
+            "/compact": None,
             "/history": None,
             "/threads": None,
             "/resume": {"latest": None},

@@ -57,9 +57,33 @@ final class ChatAddressingTests: XCTestCase {
         XCTAssertFalse(r.addresses("Ada", in: pending))
     }
 
-    func testUserNamingOneAgentDoesNotWakeTheOthers() {
-        let r = room([("Ada", "opening"), ("user", "Quill, ship it")])
-        XCTAssertFalse(r.addresses("Ada", in: [r.messages[1]]))
+    /// A user @-tag sets expectation, not exclusivity: the tagged agent is
+    /// expected to reply, but the others are still woken so they can chime in.
+    func testUserTagExpectsOneButLetsOthersChimeIn() {
+        let r = room([("Ada", "opening"), ("user", "@Quill ship it")])
+        let pending = [r.messages[1]]
+        // Quill is woken AND specifically expected.
+        XCTAssertTrue(r.addresses("Quill", in: pending))
+        XCTAssertTrue(r.expects("Quill", in: pending))
+        // Ada is woken too (may chime in) but is NOT the expected responder.
+        XCTAssertTrue(r.addresses("Ada", in: pending))
+        XCTAssertFalse(r.expects("Ada", in: pending))
+    }
+
+    func testTaggedAgentsListsWhoWasAsked() {
+        let r = room([("user", "@Quill and @Ada please weigh in")])
+        XCTAssertEqual(Set(r.taggedAgents(in: r.messages)), ["Quill", "Ada"])
+    }
+
+    /// An untagged user post still broadcasts (the user's floor) — everyone
+    /// can chime in, and nobody is the singled-out expected responder.
+    func testUntaggedUserPostBroadcastsWithNoOneExpected() {
+        let r = room([("Ada", "opening"), ("user", "what do we all think?")])
+        let pending = [r.messages[1]]
+        XCTAssertTrue(r.addresses("Ada", in: pending))
+        XCTAssertTrue(r.addresses("Quill", in: pending))
+        XCTAssertFalse(r.expects("Ada", in: pending))
+        XCTAssertFalse(r.expects("Quill", in: pending))
     }
 
     /// The loop brake: an agent talking to the room without addressing anyone

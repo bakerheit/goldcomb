@@ -2,6 +2,7 @@
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from goldcomb.config import Config
-from goldcomb.server import JsonEventRenderer, _dispatch
+from goldcomb.server import JsonEventRenderer, _dispatch, _models_for
 
 
 class Sink:
@@ -94,6 +95,97 @@ def make_cfg(tmp_path):
     }
     path.write_text(json.dumps(data))
     return Config(data, path)
+
+
+# ---- model list for the GUI picker (the "only default model" bug) -----------
+
+
+def test_models_for_falls_back_to_builtin_when_uncached(tmp_path):
+    """A freshly-added provider has no cached /models fetch. The picker must
+    still get the adapter's built-in list, not an empty list that renders as
+    just "default model"."""
+    path = tmp_path / "config.json"
+    data = {"providers": {"anthropic": {"type": "anthropic", "api_key": "k"}},
+            "current": {"provider": "anthropic", "model": "claude-opus-4-8"},
+            "settings": {}, "models_cache": {}}
+    cfg = Config(data, path)
+    models = _models_for(cfg, "anthropic")
+    assert len(models) > 1
+    assert "claude-opus-4-8" in models
+
+
+def test_models_for_prefers_the_live_cache(tmp_path):
+    """A live fetch (the full catalog) wins over the built-in fallback."""
+    path = tmp_path / "config.json"
+    data = {"providers": {"anthropic": {"type": "anthropic", "api_key": "k"}},
+            "current": {"provider": "anthropic", "model": "claude-opus-4-8"},
+            "settings": {},
+            "models_cache": {"anthropic": ["claude-x", "claude-y", "claude-z"]}}
+    cfg = Config(data, path)
+    assert _models_for(cfg, "anthropic") == ["claude-x", "claude-y", "claude-z"]
+
+
+def test_models_for_unknown_type_is_empty_not_a_crash(tmp_path):
+    path = tmp_path / "config.json"
+    data = {"providers": {"weird": {"type": "nonesuch"}},
+            "current": {}, "settings": {}, "models_cache": {}}
+    cfg = Config(data, path)
+    assert _models_for(cfg, "weird") == []
+
+
+def test_models_command_fetches_and_caches(tmp_path, monkeypatch):
+    """The GUI's 'Refresh from API' path: live-fetch, cache, emit models."""
+    import goldcomb.server as server
+
+    cfg = make_cfg(tmp_path)
+
+    class _P:
+        def list_models(self):
+            return ["m-1", "m-2", "m-3"]
+
+    monkeypatch.setattr(server, "build_provider", lambda *a, **k: _P(),
+                        raising=False)
+    # build_provider is imported inside the handler; patch at its source too.
+    monkeypatch.setattr("goldcomb.providers.build_provider",
+                        lambda *a, **k: _P())
+
+    sink = Sink()
+    _dispatch(DummyApp(cfg), cfg, {"type": "models", "provider": "openai"}, sink)
+
+    ev = sink.events[-1]
+    assert ev["event"] == "models" and ev["ok"] is True
+    assert ev["provider"] == "openai" and ev["models"] == ["m-1", "m-2", "m-3"]
+    # Cached, so later reads (and the next ready event) have the full list.
+    assert cfg.models_for("openai") == ["m-1", "m-2", "m-3"]
+
+
+def test_models_command_falls_back_on_fetch_error(tmp_path, monkeypatch):
+    from goldcomb.providers import ProviderError
+
+    cfg = make_cfg(tmp_path)
+
+    class _P:
+        def list_models(self):
+            raise ProviderError("network down")
+
+    monkeypatch.setattr("goldcomb.providers.build_provider",
+                        lambda *a, **k: _P())
+
+    sink = Sink()
+    _dispatch(DummyApp(cfg), cfg, {"type": "models", "provider": "openai"}, sink)
+
+    ev = sink.events[-1]
+    assert ev["event"] == "models" and ev["ok"] is False
+    assert "network down" in ev["error"]
+    # Still hands back the built-in list so the picker isn't left empty.
+    assert len(ev["models"]) > 1
+
+
+def test_models_command_unknown_provider_errors(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = Sink()
+    _dispatch(DummyApp(cfg), cfg, {"type": "models", "provider": "ghost"}, sink)
+    assert sink.events[-1]["event"] == "error"
 
 
 def test_dispatch_user_runs_turn_and_ends(tmp_path):
@@ -198,6 +290,182 @@ def test_dispatch_scrum_action_errors(tmp_path, monkeypatch):
     assert ev["event"] == "scrum_result"
     assert ev["ok"] is False
     assert "unknown action" in ev["message"]
+
+
+# ---- git_status command -----------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_dispatch_git_status_emits_event(tmp_path, monkeypatch):
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                       capture_output=True, text=True)
+
+    _git("init", "-q")
+    _git("config", "user.email", "t@t.co")
+    _git("config", "user.name", "t")
+    (tmp_path / "a.txt").write_text("one\n")
+    _git("add", "a.txt")
+    _git("commit", "-q", "-m", "init")
+    # a dirty file so files is non-empty
+    (tmp_path / "a.txt").write_text("one\ntwo\n")
+
+    monkeypatch.chdir(tmp_path)
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_status"}, sink)
+
+    ev = sink.events[-1]
+    assert ev["event"] == "git_status"
+    assert ev["branch"]
+    assert any(f["path"] == "a.txt" for f in ev["files"])
+
+
+def test_dispatch_git_status_non_repo_errors(tmp_path, monkeypatch):
+    sub = tmp_path / "not_a_repo"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_status"}, sink)
+    assert sink.events[-1]["event"] == "error"
+
+
+# ---- git_diff command -------------------------------------------------------
+
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git not installed"
+)
+
+
+@pytest.fixture()
+def diff_repo(tmp_path, monkeypatch):
+    """A throwaway git repo (same shape as test_git_tools' fixture) that the
+    --serve handler runs in: one committed file, a.txt. cwd is the repo."""
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                       capture_output=True, text=True)
+
+    _git("init", "-q")
+    _git("config", "user.email", "t@t.co")
+    _git("config", "user.name", "t")
+    (tmp_path / "a.txt").write_text("one\n")
+    _git("add", "a.txt")
+    _git("commit", "-q", "-m", "init")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+@requires_git
+def test_dispatch_git_diff_returns_unified_text(diff_repo, tmp_path):
+    (diff_repo / "a.txt").write_text("one\nTWO_ADDED\n")
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_diff", "path": "a.txt"}, sink)
+
+    ev = sink.events[-1]
+    assert ev["event"] == "git_diff"
+    assert ev["path"] == "a.txt"
+    assert ev["staged"] is False
+    assert "TWO_ADDED" in ev["diff"]
+    assert ev["truncated"] is False
+
+
+@requires_git
+def test_dispatch_git_diff_staged_vs_unstaged(diff_repo, tmp_path):
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=diff_repo, check=True,
+                       capture_output=True, text=True)
+
+    # Stage one change, then make a second, unstaged change on top.
+    (diff_repo / "a.txt").write_text("one\nSTAGED_LINE\n")
+    _git("add", "a.txt")
+    (diff_repo / "a.txt").write_text("one\nSTAGED_LINE\nUNSTAGED_LINE\n")
+
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg,
+              {"type": "git_diff", "path": "a.txt", "staged": True}, sink)
+    ev = sink.events[-1]
+    assert ev["event"] == "git_diff" and ev["staged"] is True
+    assert "STAGED_LINE" in ev["diff"]
+    assert "UNSTAGED_LINE" not in ev["diff"]
+
+    _dispatch(app, cfg,
+              {"type": "git_diff", "path": "a.txt", "staged": False}, sink)
+    ev = sink.events[-1]
+    assert ev["event"] == "git_diff" and ev["staged"] is False
+    assert "UNSTAGED_LINE" in ev["diff"]
+
+
+@requires_git
+def test_dispatch_git_diff_untracked_file_notice(diff_repo, tmp_path):
+    (diff_repo / "new.txt").write_text("brand new\n")
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_diff", "path": "new.txt"}, sink)
+
+    ev = sink.events[-1]
+    assert ev["event"] == "git_diff"
+    assert "new file, no diff" in ev["diff"]
+    assert ev["truncated"] is False
+
+
+@requires_git
+def test_dispatch_git_diff_non_repo_errors(tmp_path, monkeypatch):
+    sub = tmp_path / "not_a_repo"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_diff", "path": "a.txt"}, sink)
+    assert sink.events[-1]["event"] == "error"
+
+
+@requires_git
+def test_dispatch_git_diff_missing_path_errors(diff_repo, tmp_path):
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_diff"}, sink)
+    _dispatch(app, cfg, {"type": "git_diff", "path": "  "}, sink)
+    assert sink.kinds() == ["error", "error"]
+
+
+@requires_git
+def test_dispatch_git_diff_rejects_path_traversal(diff_repo, tmp_path):
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_diff", "path": "../escape.txt"}, sink)
+    ev = sink.events[-1]
+    assert ev["event"] == "error"
+    assert "escapes" in ev["message"]
+
+
+@requires_git
+def test_dispatch_git_diff_truncates_huge_output(diff_repo, tmp_path):
+    from goldcomb import git_tools
+
+    def _git(*args):
+        subprocess.run(["git", *args], cwd=diff_repo, check=True,
+                       capture_output=True, text=True)
+
+    # Commit a big file, then change every line so the diff exceeds MAX_OUTPUT.
+    (diff_repo / "big.txt").write_text(
+        "".join(f"line {i}\n" for i in range(5000)))
+    _git("add", "big.txt")
+    _git("commit", "-q", "-m", "big")
+    (diff_repo / "big.txt").write_text(
+        "".join(f"changed {i}\n" for i in range(5000)))
+
+    cfg = make_cfg(tmp_path)
+    app, sink = DummyApp(cfg), Sink()
+    _dispatch(app, cfg, {"type": "git_diff", "path": "big.txt"}, sink)
+
+    ev = sink.events[-1]
+    assert ev["event"] == "git_diff"
+    assert ev["truncated"] is True
+    assert "truncated" in ev["diff"]
+    assert len(ev["diff"]) <= git_tools.MAX_OUTPUT + 100
 
 
 # ---- subprocess smoke (no network) -----------------------------------------

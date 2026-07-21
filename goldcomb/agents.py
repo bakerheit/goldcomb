@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,35 @@ MAX_SUBAGENT_ITERATIONS = 15
 #: Where handle records persist for out-of-process readers (the macOS app).
 REGISTRY_DIR = Path(".ai") / "agents"
 
+#: Per-agent deploy config the macOS app writes from its Agents tab: an agent's
+#: user-chosen default model. The deploy flow honors it so a lead deploying a
+#: pre-configured agent runs it on the model the user picked (NEXA "both").
+AGENT_CONFIG_FILE = REGISTRY_DIR / "agent-config.json"
+
+
+def configured_default(name: str) -> tuple[str | None, str | None]:
+    """The user-configured default (provider, model) for the agent called
+    ``name``, from ``.ai/agents/agent-config.json`` — written by the macOS
+    app's Agents tab. ``(None, None)`` when unconfigured or the file is
+    absent/unreadable. Matches the full human name and, as a fallback, the bare
+    functional label inside ``"Name (label)"`` so a deploy that passed the raw
+    label still resolves."""
+    try:
+        data = json.loads(AGENT_CONFIG_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return (None, None)
+    entries = data.get("agents") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        return (None, None)
+    entry = entries.get(name)
+    if entry is None:
+        m = re.search(r"\(([^)]+)\)\s*$", name)  # "Quill Ashwood (swift-worker-2)"
+        if m:
+            entry = entries.get(m.group(1))
+    if not isinstance(entry, dict):
+        return (None, None)
+    return (entry.get("provider") or None, entry.get("model") or None)
+
 #: Heartbeat: a running worker touches the scrum board on its own behalf this
 #: often, so a long tool-less stretch (a slow model turn) doesn't look dead.
 _HEARTBEAT_INTERVAL_S = 60.0
@@ -49,7 +79,8 @@ you know is in the task brief.
 
 Verify your work: after writing or changing code, run it or its tests. Read a \
 file before you edit it; if the same command fails twice, change your approach \
-instead of repeating it.
+instead of repeating it. For repo state, prefer the git_status/git_diff/\
+git_log/git_branch tools over run_bash("git ...").
 
 Your FINAL message is your report back to the lead agent — it is the only \
 thing returned, so make it self-contained: what you did, what you found, exact \

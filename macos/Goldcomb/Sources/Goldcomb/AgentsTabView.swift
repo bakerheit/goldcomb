@@ -14,6 +14,8 @@ struct AgentsTabView: View {
 
     @State private var addTarget: AddTarget? = nil
     @State private var removing: AgentSession? = nil
+    /// The agent whose configuration sheet is open (card click / "Configure…").
+    @State private var configuring: AgentSession? = nil
     /// The card currently hovered by a dragged agent (gold highlight).
     @State private var dropTargetID: UUID? = nil
 
@@ -110,6 +112,11 @@ struct AgentsTabView: View {
                 )
             }
         }
+        .sheet(item: $configuring) { agent in
+            AgentConfigSheet(agent: agent) {
+                store.selection = .agent(agent.id)  // "Open chat" from config
+            }
+        }
         .confirmationDialog(
             "Remove “\(removing?.name ?? "")” from the team?",
             isPresented: Binding(
@@ -161,6 +168,7 @@ struct AgentsTabView: View {
                     isCurrent: agent.id == session.id,
                     isDropTarget: dropTargetID == agent.id,
                     onChat: { store.selection = .agent(agent.id) },
+                    onConfigure: { configuring = agent },
                     onAddChild: { addTarget = AddTarget(parent: agent) },
                     onRemove: { removing = agent }
                 )
@@ -220,6 +228,7 @@ private struct AgentNodeCard: View {
     let isCurrent: Bool
     let isDropTarget: Bool
     var onChat: () -> Void
+    var onConfigure: () -> Void
     var onAddChild: () -> Void
     var onRemove: () -> Void
 
@@ -274,6 +283,10 @@ private struct AgentNodeCard: View {
                         Image(systemName: "bubble.left.fill")
                     }
                     .help("Open this agent's chat")
+                    Button { onConfigure() } label: {
+                        Image(systemName: "gearshape.fill")
+                    }
+                    .help("Configure \(agent.name)")
                     Button { onAddChild() } label: {
                         Image(systemName: "plus.circle.fill")
                     }
@@ -293,8 +306,11 @@ private struct AgentNodeCard: View {
             }
         }
         .onHover { hovering = $0 }
-        .onTapGesture { onChat() }
+        // Clicking the card opens its configuration; the message icon (and the
+        // context menu) is what opens the chat.
+        .onTapGesture { onConfigure() }
         .contextMenu {
+            Button("Configure…") { onConfigure() }
             Button("Open chat") { onChat() }
             Button("Add report") { onAddChild() }
             Divider()
@@ -382,5 +398,123 @@ private struct AddTreeAgentSheet: View {
             return "A hands-on agent; it claims tickets under its own name as "
                 + "it works."
         }
+    }
+}
+
+/// An agent's settings, opened by clicking its card (chat stays on the message
+/// icon). Editable: display role, description, default model, sudo. Identity
+/// (name, persona, folder) and the live model are read-only info.
+struct AgentConfigSheet: View {
+    @EnvironmentObject var store: SessionStore
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var agent: AgentSession
+    /// Called when the user hits "Open chat" from within the sheet.
+    var onChat: () -> Void
+
+    @State private var role = ""
+    @State private var description = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            header
+            Divider()
+            Form {
+                Section("Identity") {
+                    LabeledContent("Persona", value: agent.personaRole ?? "worker")
+                    LabeledContent("Model now",
+                                   value: "\(agent.provider) · \(agent.model)")
+                    LabeledContent("Folder") {
+                        Text(agent.directory.path)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                Section("Settings") {
+                    TextField("Display role (optional)", text: $role)
+                    TextField("Description (optional)", text: $description,
+                              axis: .vertical)
+                        .lineLimit(2...5)
+                    LabeledContent("Default model") { defaultModelMenu }
+                    Toggle("sudo — run tool calls without asking", isOn: sudoBinding)
+                }
+            }
+            .formStyle(.grouped)
+            footer
+        }
+        .padding(20)
+        .frame(width: 480)
+        .onAppear { role = agent.role; description = agent.description }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Circle().fill(statusColor).frame(width: 10, height: 10)
+            Text(agent.name).font(.title3.bold())
+            Spacer()
+            Button {
+                save()
+                onChat()
+                dismiss()
+            } label: {
+                Label("Open chat", systemImage: "bubble.left.fill")
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            Spacer()
+            Button("Done") { save(); dismiss() }
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    /// Choose the agent's default model — the model it launches on whenever its
+    /// process starts (group chat, delegation, or a plain open). Models come
+    /// from the agent's live catalog; if empty, offer a refresh.
+    private var defaultModelMenu: some View {
+        Menu(agent.defaultModel ?? "App default") {
+            if agent.defaultModel != nil {
+                Button("Use app default") {
+                    store.setAgentDefaultModel(agent, provider: "", model: "")
+                }
+                Divider()
+            }
+            if agent.knownProviders.isEmpty {
+                Button("Refresh from API") { agent.refreshModels() }
+            } else {
+                ForEach(agent.knownProviders.keys.sorted(), id: \.self) { name in
+                    Menu(name) {
+                        ForEach(agent.knownProviders[name] ?? [], id: \.self) { model in
+                            Button {
+                                store.setAgentDefaultModel(agent, provider: name,
+                                                           model: model)
+                            } label: {
+                                if agent.defaultProvider == name
+                                    && agent.defaultModel == model {
+                                    Label(model, systemImage: "checkmark")
+                                } else {
+                                    Text(model)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .fixedSize()
+    }
+
+    private var sudoBinding: Binding<Bool> {
+        Binding(get: { agent.sudo }, set: { agent.setSudo($0) })
+    }
+
+    private var statusColor: Color {
+        agent.isRunning ? .orange : (agent.isAlive ? .green : .gray)
+    }
+
+    private func save() {
+        store.updateAgentMetadata(agent, role: role, description: description)
     }
 }

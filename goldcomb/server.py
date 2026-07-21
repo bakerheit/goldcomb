@@ -34,13 +34,31 @@ Events (stdout, one JSON object per line):
   turn_end         {"session_in","session_out","thread_id"} — the turn finished
   threads          {"threads":[{id,title,updated,cwd,provider,model,
                    message_count}]} — reply to a threads command
+  git_status       {"branch","ahead","behind","files":[{path,status}]} —
+                   reply to a git_status command (working-tree state)
+  git_diff         {"path","staged","diff","truncated"} — reply to a git_diff
+                   command: one file's unified diff (diff carries a
+                   "new file, no diff" notice for untracked files; truncated
+                   is true when the diff hit the size cap)
   resumed          {"thread_id","title","message_count"} — reply to resume
+  compacted        {"ok","before","after","reason"} — reply to a compact
+                   command; history was summarized (before→after messages),
+                   or ok=false with a reason ("too-short"/"empty-summary")
+  models           {"provider","models":[...],"ok","error"?} — reply to a
+                   models command: the provider's live catalog (ok=true), or
+                   the built-in fallback list with ok=false + error on a fetch
+                   failure
   interrupted      the turn was aborted (e.g. SIGINT)
   error            {"message"}
 
 Commands (stdin, one JSON object per line):
   {"type":"user","text":...}                       run one agentic turn
   {"type":"threads"}                               list saved threads
+  {"type":"git_status"}                            working-tree status (polled
+                                                   mid-turn or idle)
+  {"type":"git_diff","path":<repo-relative>,       one file's unified diff
+   "staged":true|false}                            (staged = the index; default
+                                                   false = the working tree)
   {"type":"resume","id":<thread-id|prefix>}        resume a saved thread
   {"type":"confirm","decision":"yes|no|always|abort"}   answer confirm_request
   {"type":"answer","answers":["...", ...]}         answer ask_request, one
@@ -52,6 +70,12 @@ Commands (stdin, one JSON object per line):
                                                    the config file)
   {"type":"clear"}                                 start a fresh conversation
                                                    (drops history, new thread)
+  {"type":"compact"}                               summarize history in place
+                                                   (keeps the thread; replies
+                                                   with a compacted event)
+  {"type":"models","provider":<name>}              live-fetch a provider's full
+                                                   model catalog (defaults to
+                                                   current); replies with models
   {"type":"sudo","on":true|false}                  toggle auto-approve
   {"type":"scrum","on":true|false}                 enable/disable per-project
                                                    ticket tracking (the scrum
@@ -86,6 +110,21 @@ from typing import Any, Callable
 from .config import DEFAULT_MODEL_BY_TYPE, Config
 
 Emit = Callable[[dict[str, Any]], None]
+
+
+def _models_for(cfg: Config, name: str) -> list[str]:
+    """Models to offer for a provider: the live-fetched cache if we have one,
+    else the adapter's built-in list. Without the fallback a freshly-added
+    provider surfaces no models until the user runs a live fetch, so a GUI's
+    model picker shows only "default model" (the bug this fixes). Mirrors the
+    CLI's ``cached or default_models_for(ptype)``."""
+    from .providers import default_models_for
+
+    cached = cfg.models_for(name)
+    if cached:
+        return cached
+    ptype = cfg.providers.get(name, {}).get("type", "")
+    return default_models_for(ptype)
 
 
 class JsonEventRenderer:
@@ -316,7 +355,7 @@ def serve(cfg: Config, *, sudo: bool = False) -> int:
                 name: {
                     "type": entry.get("type", ""),
                     "has_key": cfg.resolve_api_key(name) is not None,
-                    "models": cfg.models_for(name),
+                    "models": _models_for(cfg, name),
                 }
                 for name, entry in cfg.providers.items()
             },
@@ -396,6 +435,50 @@ def _dispatch(app, cfg: Config, cmd: dict[str, Any], emit: Emit) -> None:
         app.messages.clear()
         app.thread = None
         emit({"event": "cleared"})
+    elif kind == "compact":
+        # Summarize the conversation and continue from the summary (mirrors
+        # /compact in the CLI). Unlike clear, the thread is kept — the next
+        # autosave writes the compacted history over it.
+        from .providers import ProviderError
+
+        try:
+            provider = app.get_provider()
+            result = app.compact_conversation(provider)
+        except ProviderError as e:
+            emit({"event": "error", "message": f"compaction failed: {e}"})
+            return
+        if result.get("ok"):
+            app._autosave()
+        emit({
+            "event": "compacted",
+            "ok": bool(result.get("ok")),
+            "before": result.get("before", 0),
+            "after": result.get("after", 0),
+            "reason": result.get("reason"),
+        })
+    elif kind == "models":
+        # Live-fetch a provider's full catalog and cache it, then reply with a
+        # models event so a GUI picker can show everything the provider offers
+        # (not just the built-in list the ready event carried). Defaults to the
+        # current provider.
+        from .providers import ProviderError, build_provider
+
+        name = cmd.get("provider") or cfg.current_provider
+        if not name or name not in cfg.providers:
+            emit({"event": "error", "message": f"unknown provider: {name}"})
+            return
+        entry = dict(cfg.providers[name])
+        entry["api_key"] = cfg.resolve_api_key(name)
+        try:
+            models = build_provider(name, entry).list_models()
+        except ProviderError as e:
+            # Fall back to the built-in list so the picker still has options.
+            emit({"event": "models", "provider": name,
+                  "models": _models_for(cfg, name), "ok": False,
+                  "error": str(e)})
+            return
+        cfg.cache_models(name, models)
+        emit({"event": "models", "provider": name, "models": models, "ok": True})
     elif kind == "scrum":
         from . import scrum as scrum_mod
 
@@ -416,6 +499,56 @@ def _dispatch(app, cfg: Config, cmd: dict[str, Any], emit: Emit) -> None:
         emit({"event": "scrum_result", "action": action, "message": message, "ok": ok})
     elif kind == "threads":
         emit({"event": "threads", "threads": _thread_summaries()})
+    elif kind == "git_status":
+        # The GUI polls this while an agent is mid-turn or idle, so it is
+        # handled directly (like threads) — never gated on a turn in progress.
+        # git_tools returns a clean error dict for not-a-repo / no-git rather
+        # than raising, so this branch can never crash the server loop.
+        from . import git_tools
+
+        res = git_tools.git_status(str(Path.cwd()))
+        if "error" in res:
+            emit({"event": "error", "message": res["error"]})
+        else:
+            emit({
+                "event": "git_status",
+                "branch": res["branch"],
+                "ahead": res["ahead"],
+                "behind": res["behind"],
+                "files": res["files"],
+            })
+    elif kind == "git_diff":
+        # Like git_status: the GUI asks for a file's diff outside any turn, so
+        # this calls git_tools directly. git_tools returns a clean error dict
+        # for not-a-repo / no-git / bad-path rather than raising.
+        from . import git_tools
+
+        root = Path.cwd()
+        raw = str(cmd.get("path") or "").strip()
+        if not raw:
+            emit({"event": "error", "message": "git_diff command with no path"})
+            return
+        staged = bool(cmd.get("staged", False))
+        # Path traversal guard: the path must resolve INSIDE the project root
+        # (../../etc/passwd or an absolute path outside the repo is refused).
+        try:
+            resolved = (root / raw).resolve(strict=False)
+            resolved.relative_to(root.resolve())
+        except (OSError, ValueError):
+            emit({"event": "error",
+                  "message": f"git_diff path escapes the project: {raw}"})
+            return
+        res = git_tools.git_diff(str(root), path=raw, staged=staged)
+        if "error" in res:
+            emit({"event": "error", "message": res["error"]})
+        else:
+            emit({
+                "event": "git_diff",
+                "path": raw,
+                "staged": staged,
+                "diff": res["diff"],
+                "truncated": res["truncated"],
+            })
     elif kind == "resume":
         ident = str(cmd.get("id") or "").strip()
         if not ident:

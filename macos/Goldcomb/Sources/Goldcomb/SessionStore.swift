@@ -314,7 +314,8 @@ final class SessionStore: ObservableObject {
                         session.pendingQuestions == nil
                     else { continue }
                     session.sendUserMessage(
-                        chatDigest(room: room, messages: foreign, recipient: name))
+                        chatDigest(room: room, messages: foreign, recipient: name,
+                                   tagged: room.taggedAgents(in: foreign)))
                     chatCursors[key] = room.messages.count
                     dirty = true
                 }
@@ -326,7 +327,7 @@ final class SessionStore: ObservableObject {
     }
 
     private func chatDigest(room: ChatRoom, messages: [ChatMessage],
-                            recipient: String) -> String {
+                            recipient: String, tagged: [String]) -> String {
         let lines = messages.suffix(12).map { m -> String in
             let who = m.isUser ? "user (the human)" : m.from
             // Attached files are invisible to the agent unless the digest
@@ -335,46 +336,67 @@ final class SessionStore: ObservableObject {
             let atts = m.attachments.map { "\n  " + $0.digestLine }.joined()
             return "\(who): \(m.text)\(atts)"
         }
+        // Framing depends on whether — and whom — the message @-tagged. A
+        // tagged agent is expected to answer; an untagged one is a bystander
+        // who may chime in; an untagged broadcast is open to everyone.
+        let short = { (n: String) in n.split(separator: "(").first.map(String.init)?
+            .trimmingCharacters(in: .whitespaces) ?? n }
+        let stance: String
+        if tagged.contains(recipient) {
+            stance = "You (\(short(recipient))) were tagged — a reply is expected of you. "
+        } else if !tagged.isEmpty {
+            let who = tagged.map(short).joined(separator: ", ")
+            stance = "\(who) was tagged, not you — chime in only if you have "
+                + "something specific to add. "
+        } else {
+            stance = "This is an open message to the room — respond if you have "
+                + "something to add. "
+        }
         return """
         [chat \(room.id)] New in "\(room.title)" \
         (participants: \(room.participants.joined(separator: ", "))):
         \(lines.joined(separator: "\n"))
 
-        You are \(recipient). If you have something substantive to add, reply \
-        with the chat tool (action='post', id='\(room.id)'); action='read' \
-        shows the full history. If you have nothing to add, don't post — \
-        just say so in one line and stop.
+        \(stance)Reply with the chat tool (action='post', id='\(room.id)'); \
+        action='read' shows the full history. If you have nothing to add, \
+        don't post — just say so in one line and stop.
 
-        Name the teammates you expect an answer from — only the agents a \
-        message names are woken by it. A post that names nobody is left for \
-        the human to read, so say who it is for when you need a reply.
+        Tag the teammates you expect an answer from with @name; a tagged \
+        agent is expected to reply, and others may still chime in.
         """
     }
 
     /// Promotions the user has explicitly undone (closed the agent row while
-    /// its deploy record was still around) — don't resurrect those on the
-    /// next poll tick. Session-local by design: a fresh launch re-promotes.
-    private var declinedPromotions: Set<String> = []
+    /// its deploy record was still around) — don't resurrect those. Persisted
+    /// across launches: promotion is now permanent (see promoteDeploys), so a
+    /// removed agent must stay removed, not re-promote from its lingering
+    /// on-disk record on the next launch.
+    private var declinedPromotions: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: "declinedPromotions") ?? [])
+
+    private func decline(_ key: String) {
+        declinedPromotions.insert(key)
+        UserDefaults.standard.set(Array(declinedPromotions),
+                                  forKey: "declinedPromotions")
+    }
 
     private func promotionKey(_ projectID: UUID, _ label: String) -> String {
         "\(projectID.uuidString)#\(label)"
     }
 
-    /// A deployed worker joins the project roster the moment its record
-    /// appears: the identity (name, memory file, thread history, roster
-    /// entry) already exists — promotion just gives that person a chattable
-    /// session, parented under whichever agent deployed them. While the
-    /// deploy is still running, the row wears a busy indicator (blue) instead
-    /// of idle green. Stale records (older than the sidebar linger) never
-    /// promote.
+    /// Every deployed worker becomes a permanent, configurable roster member:
+    /// the identity (name, memory file, thread history, roster entry) already
+    /// exists — promotion gives that person a chattable session, parented under
+    /// whichever agent deployed them, so the user can see and configure it (its
+    /// default model, etc.). Once promoted it persists like any agent; the user
+    /// removes it explicitly if they don't want it (recorded in
+    /// declinedPromotions). No age window: a deploy the user ran hours ago still
+    /// joins the roster.
     private func promoteDeploys(_ byProject: [UUID: [SubAgentRecord]]) {
-        let cutoff = Date().timeIntervalSince1970 - 20 * 60
         for (projectID, records) in byProject {
             guard let project = projects.first(where: { $0.id == projectID })
             else { continue }
             for record in records {
-                guard record.isLive || (record.endedAt ?? 0) > cutoff
-                else { continue }
                 if declinedPromotions.contains(promotionKey(projectID, record.label)) {
                     continue
                 }
@@ -452,10 +474,11 @@ final class SessionStore: ObservableObject {
                                        personaRole: $0.personaRole,
                                        projectID: $0.projectID,
                                        parentID: $0.parentID)
-                if $0.isAlive {
-                    agent.provider = $0.provider
-                    agent.model = $0.model
-                }
+                // Persist the user-chosen DEFAULT (Agents tab), not the live
+                // running model — a live model change from the chat chip is a
+                // per-session override and must not become the saved default.
+                agent.provider = $0.defaultProvider
+                agent.model = $0.defaultModel
                 return agent
             }
         )
@@ -471,6 +494,37 @@ final class SessionStore: ObservableObject {
             try data.write(to: url, options: .atomic)
         } catch {
             NSLog("goldcomb: could not persist sidebar state: \(error.localizedDescription)")
+        }
+        writeAgentConfigs()
+    }
+
+    /// Publish each project's per-agent default models to
+    /// `<project>/.ai/agents/agent-config.json`, so the deploy flow
+    /// (goldcomb/agents.py `configured_default`) launches a deployed agent on
+    /// the model the user chose for it. Keyed by the agent's name (the deploy
+    /// side also matches the bare label inside "Name (label)"). Written next to
+    /// the sidebar state so app and CLI stay in step.
+    private func writeAgentConfigs() {
+        for project in projects {
+            var entries: [String: [String: String]] = [:]
+            for a in sessions where a.projectID == project.id {
+                guard let model = a.defaultModel, !model.isEmpty else { continue }
+                entries[a.name] = ["provider": a.defaultProvider ?? "",
+                                   "model": model]
+            }
+            let dir = project.directory.appendingPathComponent(".ai/agents")
+            let url = dir.appendingPathComponent("agent-config.json")
+            if entries.isEmpty {
+                try? FileManager.default.removeItem(at: url)  // nothing configured
+                continue
+            }
+            let payload: [String: Any] = ["version": 1, "agents": entries]
+            guard let data = try? JSONSerialization.data(
+                withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            else { continue }
+            try? FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
         }
     }
 
@@ -504,7 +558,9 @@ final class SessionStore: ObservableObject {
                 sudo: saved.sudo,
                 personaRole: saved.personaRole,
                 role: saved.role,
-                description: saved.description
+                description: saved.description,
+                defaultProvider: saved.provider,
+                defaultModel: saved.model
             )
             let savedProject = saved.projectID.flatMap { id in
                 projects.first { $0.id == id }
@@ -582,6 +638,33 @@ final class SessionStore: ObservableObject {
         session.onIdentityChange = { [weak self] in self?.save() }
         session.start()
         return session
+    }
+
+    /// Set an agent's default model (Agents tab / "set as default"). Persists
+    /// it so the agent launches on this model in future — including when woken
+    /// for a group chat or delegated to. If the agent is running, it's applied
+    /// live too (a `use` command) so it takes effect without a restart; an
+    /// empty provider clears the default (back to the app's global default).
+    func setAgentDefaultModel(_ session: AgentSession,
+                              provider: String, model: String) {
+        let p = provider.trimmingCharacters(in: .whitespaces)
+        session.defaultProvider = p.isEmpty ? nil : p
+        session.defaultModel = model.trimmingCharacters(in: .whitespaces).isEmpty
+            ? nil : model.trimmingCharacters(in: .whitespaces)
+        save()
+        if session.isAlive, let dp = session.defaultProvider {
+            session.use(provider: dp, model: session.defaultModel ?? "")
+        }
+    }
+
+    /// Edit an agent's display metadata (role/description) from the config
+    /// sheet. These are app-side only (not passed to the process), so the
+    /// change is live — just persist it.
+    func updateAgentMetadata(_ session: AgentSession, role: String,
+                             description: String) {
+        session.role = role.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.description = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        save()
     }
 
     // MARK: agent tree (Agents tab)
@@ -692,7 +775,7 @@ final class SessionStore: ObservableObject {
         // would recreate the session two seconds from now.
         if let projectID = session.projectID,
            subAgents[projectID]?.contains(where: { $0.label == session.name }) == true {
-            declinedPromotions.insert(promotionKey(projectID, session.name))
+            decline(promotionKey(projectID, session.name))
         }
         session.stop()
         sessions.removeAll { $0.id == session.id }
@@ -734,6 +817,13 @@ final class SessionStore: ObservableObject {
             selection = projects.last.map { .project($0.id) }
         }
         save()
+    }
+
+    /// The project a session directory belongs to (NEXA-114: ChatView's
+    /// ticket-link handler routes via this, like rooms do via
+    /// `projectID(forRoom:)`). Thin public wrapper over `matchingProject`.
+    func projectID(forDirectory directory: URL) -> UUID? {
+        matchingProject(for: directory)?.id
     }
 
     private func matchingProject(for directory: URL) -> Project? {

@@ -65,9 +65,12 @@ final class AgentSession: ObservableObject, Identifiable {
     let personaRole: String?
     /// User-facing organizational role. This is metadata only and is shown in
     /// the sidebar; it is deliberately separate from the CLI persona role.
-    let role: String
+    /// Display-only (never passed to the process), so it's editable live from
+    /// the agent config sheet with no restart.
+    @Published var role: String
     /// Free-form user-facing notes about this agent's responsibilities.
-    let description: String
+    /// Display-only, editable live (see `role`).
+    @Published var description: String
     /// Project this agent is grouped under in the sidebar, if any.
     var projectID: UUID?
     /// Parent in the project's agent tree (Agents tab), if any. nil = root.
@@ -76,6 +79,15 @@ final class AgentSession: ObservableObject, Identifiable {
     /// launch and passed as `--team` (a system-prompt block). Snapshot
     /// semantics: tree edits after launch apply on the next restart.
     var teamContext: String?
+    /// The user-chosen default provider/model for this agent (Agents tab),
+    /// passed as `--provider`/`--model` at launch so the agent runs on its own
+    /// model whenever its process starts — including when it's woken for a
+    /// group chat or delegated to, not just when the user opens its chat. nil =
+    /// inherit the app's global default. Distinct from the live `provider`/
+    /// `model` below, which reflect the running model and can be changed
+    /// per-session from the chat model chip WITHOUT touching this default.
+    @Published var defaultProvider: String?
+    @Published var defaultModel: String?
     /// Set by the SessionStore; called when persisted state (provider/model)
     /// changes so the store can re-save. Never called before start().
     var onIdentityChange: (() -> Void)?
@@ -89,6 +101,7 @@ final class AgentSession: ObservableObject, Identifiable {
     @Published var provider: String = "…"
     @Published var model: String = "…"
     @Published var knownProviders: [String: [String]] = [:]  // name → cached models
+    @Published var modelsLoading = false  // a live catalog fetch is in flight
     @Published var readyConfigRevision = 0
     @Published var currentConfigRevision = 0
     var hasStaleConfig: Bool {
@@ -103,6 +116,26 @@ final class AgentSession: ObservableObject, Identifiable {
     /// Sub-agents this agent has deployed, in start order. Derived from live
     /// events only — never persisted; the list dies with the process.
     @Published var subagents: [SubAgentInfo] = []
+    /// Read-only git working-tree state (NEXA-97), refreshed by the Project
+    /// header's poll via `requestGitStatus()`. nil = not a git repo (or not
+    /// yet fetched) — the header shows nothing git-related in that case.
+    @Published var gitStatus: GitStatus? = nil
+    /// True while a git_status command is awaiting its reply. The serve
+    /// protocol's `error` event is generic, so this is how we tell a
+    /// git-specific error (not-a-repo / git-missing → clear state, stay quiet)
+    /// from any other error (surfaced in the transcript).
+    private var gitStatusPending = false
+    /// The diff sheet's pending state (NEXA-99): the last `git_diff` reply,
+    /// or nil while a request is in flight / none has been made. Consumed by
+    /// DiffView only — the sheet clears it (back to the loading state) when
+    /// it dismisses. Single-slot: a new request replaces the previous reply.
+    @Published var gitDiff: GitDiff? = nil
+    /// The `error` event reply to a `git_diff` request (path outside the
+    /// repo, etc.), shown inline in the sheet instead of the transcript.
+    @Published var gitDiffError: String? = nil
+    /// Same trick as gitStatusPending: the serve `error` event is generic, so
+    /// this flag attributes an error to an in-flight git_diff request.
+    private var gitDiffPending = false
 
     private var process: Process?
     /// The serve process's pid — sub-agent records carry their host pid, so
@@ -126,7 +159,8 @@ final class AgentSession: ObservableObject, Identifiable {
     @Published var crashOffered = false
 
     init(id: UUID = UUID(), name: String, directory: URL, sudo: Bool,
-         personaRole: String? = nil, role: String = "", description: String = "") {
+         personaRole: String? = nil, role: String = "", description: String = "",
+         defaultProvider: String? = nil, defaultModel: String? = nil) {
         self.id = id
         self.name = name
         self.directory = directory
@@ -135,6 +169,8 @@ final class AgentSession: ObservableObject, Identifiable {
         self.personaRole = personaRole
         self.role = role.trimmingCharacters(in: .whitespacesAndNewlines)
         self.description = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.defaultProvider = defaultProvider
+        self.defaultModel = defaultModel
         NotificationCenter.default.addObserver(forName: .configRevisionChanged, object: nil,
                                                 queue: .main) { [weak self] note in
             if let revision = note.object as? Int { self?.currentConfigRevision = revision }
@@ -142,6 +178,26 @@ final class AgentSession: ObservableObject, Identifiable {
     }
 
     // MARK: - process lifecycle
+
+    /// The `goldcomb --serve` argument list for this agent. Pure over the
+    /// session's fields (given the configured base args), so the launch wiring
+    /// — including the per-agent default model — is unit-testable without
+    /// spawning a process.
+    func serveArguments(baseArgs: [String]) -> [String] {
+        // The session's name is its identity: scrum-ticket assignees and
+        // thread history are stamped with it, so the Project tab can show
+        // which agents are working on which tickets.
+        var args = baseArgs + ["--serve", "--agent-name", name]
+        if let personaRole { args += ["--role", personaRole] }
+        if let teamContext { args += ["--team", teamContext] }
+        // The agent's own default model, if the user set one — so it runs on
+        // its configured model whenever the process starts (group chat,
+        // delegation, or a plain open), not the app's global default.
+        if let p = defaultProvider, !p.isEmpty { args += ["--provider", p] }
+        if let m = defaultModel, !m.isEmpty { args += ["--model", m] }
+        if sudoAtLaunch { args.append("--sudo") }
+        return args
+    }
 
     func start() {
         guard !isAlive else { return }  // relaunch path: never spawn a second process
@@ -156,15 +212,7 @@ final class AgentSession: ObservableObject, Identifiable {
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: exe)
-        var args = Array(parts.dropFirst()) + ["--serve"]
-        // The session's name is its identity: scrum-ticket assignees and
-        // thread history are stamped with it, so the Project tab can show
-        // which agents are working on which tickets.
-        args += ["--agent-name", name]
-        if let personaRole { args += ["--role", personaRole] }
-        if let teamContext { args += ["--team", teamContext] }
-        if sudoAtLaunch { args.append("--sudo") }
-        proc.arguments = args
+        proc.arguments = serveArguments(baseArgs: Array(parts.dropFirst()))
         proc.currentDirectoryURL = directory
 
         let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
@@ -330,6 +378,28 @@ final class AgentSession: ObservableObject, Identifiable {
         send(["type": "sudo", "on": on])
     }
 
+    /// Ask the server to live-fetch a provider's full model catalog; the reply
+    /// (a `models` event) updates `knownProviders`. Defaults to the current
+    /// provider. The ready event only carries the built-in list, so this is how
+    /// the picker gets everything the provider actually offers.
+    func refreshModels(provider: String? = nil) {
+        guard isAlive else { return }
+        modelsLoading = true
+        var cmd: [String: Any] = ["type": "models"]
+        if let provider { cmd["provider"] = provider }
+        send(cmd)
+    }
+
+    /// Summarize the conversation in place to shrink context (mirrors the CLI
+    /// /compact). Unlike clearing, the thread is kept and history continues
+    /// from the summary. The server replies with a `compacted` event.
+    func compact() {
+        guard isAlive, !isRunning else { return }
+        isRunning = true  // a model call is about to run; block the composer
+        append(.log, "compacting the conversation…")
+        send(["type": "compact"])
+    }
+
     /// Turn per-project scrum tracking on/off (creates the board on first on).
     func setScrumEnabled(_ on: Bool) {
         send(["type": "scrum", "on": on])
@@ -348,6 +418,31 @@ final class AgentSession: ObservableObject, Identifiable {
         var cmd: [String: Any] = ["type": "use", "provider": provider]
         if let model, !model.isEmpty { cmd["model"] = model }
         send(cmd)
+    }
+
+    /// Ask the server for read-only git working-tree status (NEXA-97). Handled
+    /// outside the turn loop (like `threads`), so it is safe to poll while the
+    /// agent is mid-turn or idle. The reply arrives as a `git_status` event, or
+    /// an `error` event for not-a-repo / git-missing (which clears gitStatus).
+    /// Called from the Project header's existing 2s reload tick — no dedicated
+    /// polling loop. A no-op when the process is down (nothing to poll).
+    func requestGitStatus() {
+        guard process?.isRunning == true else { return }
+        gitStatusPending = true
+        send(["type": "git_status"])
+    }
+
+    /// Ask the server for one file's diff (NEXA-99), staged or unstaged.
+    /// Out-of-band like `git_status` — safe while the agent is mid-turn. The
+    /// reply arrives as a `git_diff` event (or `error`); firing a new request
+    /// immediately puts consumers back into the loading state by clearing
+    /// the previous reply.
+    func requestGitDiff(path: String, staged: Bool) {
+        guard process?.isRunning == true else { return }
+        gitDiff = nil
+        gitDiffError = nil
+        gitDiffPending = true
+        send(["type": "git_diff", "path": path, "staged": staged])
     }
 
     private func send(_ object: [String: Any]) {
@@ -478,6 +573,30 @@ final class AgentSession: ObservableObject, Identifiable {
             transcript.removeAll()
             threadId = nil
             append(.log, "new conversation")
+        case "compacted":
+            // The compact command isn't a turn, so nothing resets isRunning
+            // for us — do it here (compact() set it to block the composer).
+            isRunning = false
+            status = nil
+            if event["ok"] as? Bool == true {
+                let before = event["before"] as? Int ?? 0
+                append(.log, "compacted \(before) messages → a summary")
+            } else {
+                let reason = event["reason"] as? String ?? "unchanged"
+                append(.log, reason == "too-short"
+                       ? "nothing to compact yet — the conversation is short"
+                       : "compaction produced no summary; history unchanged")
+            }
+        case "models":
+            modelsLoading = false
+            if let name = event["provider"] as? String,
+               let models = event["models"] as? [String] {
+                knownProviders[name] = models
+            }
+            if event["ok"] as? Bool == false,
+               let err = event["error"] as? String {
+                append(.log, "couldn't fetch models: \(err)")
+            }
         case "using":
             provider = event["provider"] as? String ?? provider
             model = event["model"] as? String ?? model
@@ -520,7 +639,29 @@ final class AgentSession: ObservableObject, Identifiable {
             subagents[idx].status = reason == "error" ? .error : .completed
             subagents[idx].iterations = event["iterations"] as? Int
             subagents[idx].toolCalls = event["tool_calls"] as? Int
+        case "git_status":
+            gitStatus = GitStatus.decode(event: event)
+            gitStatusPending = false
+        case "git_diff":
+            gitDiff = GitDiff.decode(event: event)
+            gitDiffError = gitDiff == nil ? "Malformed diff reply from server." : nil
+            gitDiffPending = false
         case "error":
+            // The serve `error` event is generic. If a git_status request is
+            // in flight, this is a not-a-repo / git-missing error — clear the
+            // git state and stay quiet rather than surfacing it in the chat.
+            if gitStatusPending {
+                gitStatusPending = false
+                gitStatus = nil
+                return
+            }
+            // Same attribution for git_diff (NEXA-99): surface it inline in
+            // the diff sheet, not in the chat transcript.
+            if gitDiffPending {
+                gitDiffPending = false
+                gitDiffError = event["message"] as? String ?? "unknown error"
+                return
+            }
             append(.error, event["message"] as? String ?? "unknown error")
         default:
             break
@@ -534,21 +675,12 @@ final class AgentSession: ObservableObject, Identifiable {
 
     /// Rebuild the visible transcript from the resumed thread's interchange
     /// file (.ai/threads/<id>.jsonl) so the prior conversation is on screen.
+    /// Parsing lives in TranscriptItem.fromThreadFile (unit-testable there);
+    /// each message's `timestamp` lands on the row's `ts` (NEXA-118).
     private func hydrateTranscript(threadId: String) {
         let url = directory.appendingPathComponent(".ai/threads/\(threadId).jsonl")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-        var items: [TranscriptItem] = []
-        for line in text.split(separator: "\n").dropFirst() {
-            guard let obj = (try? JSONSerialization.jsonObject(
-                with: Data(line.utf8))) as? [String: Any],
-                  let content = obj["content"] as? String, !content.isEmpty
-            else { continue }
-            switch obj["role"] as? String {
-            case "user": items.append(TranscriptItem(kind: .user, text: content))
-            case "assistant": items.append(TranscriptItem(kind: .assistant, text: content))
-            default: break
-            }
-        }
+        let items = TranscriptItem.fromThreadFile(text)
         if !items.isEmpty {
             transcript = items
         }

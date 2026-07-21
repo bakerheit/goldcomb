@@ -183,16 +183,50 @@ final class SessionStoreTreeTests: XCTestCase {
 
     // MARK: - promoteDeploys skip paths (invariants 4, 5, 6)
 
-    /// Stale finished records (older than the 20-min linger) never promote.
-    func testPromoteDeploysSkipsStaleRecords() {
+    /// Every deployed agent becomes a permanent roster member — even a deploy
+    /// that finished long ago (no age window), so the user can configure it.
+    func testPromoteDeploysPromotesOldFinishedRecords() {
         let store = makeStore()
         let project = makeProject(store)
-        let stale = finishedRecord(label: "Old", endedAgo: 25 * 60, pid: nil)
+        let old = finishedRecord(label: "Old", endedAgo: 25 * 60, pid: nil)
 
-        store.runPromoteDeploysForTesting([project.id: [stale]])
+        store.runPromoteDeploysForTesting([project.id: [old]])
 
-        XCTAssertFalse(store.sessions.contains { $0.name == "Old" },
-                       "stale record must not promote a session")
+        XCTAssertTrue(store.sessions.contains { $0.name == "Old" },
+                      "a deployed agent must join the roster regardless of age")
+    }
+
+    /// Setting a default model publishes it to the project's deploy config, so
+    /// a lead deploying this agent runs it on the chosen model
+    /// (goldcomb/agents.py `configured_default` reads exactly this file).
+    func testDefaultModelWritesDeployConfig() throws {
+        let store = makeStore()
+        let project = makeProject(store)
+        let agent = addSession(store, name: "Quill Ashwood (swift-worker-2)",
+                               projectID: project.id)
+        store.setAgentDefaultModel(agent, provider: "anthropic",
+                                   model: "claude-opus-4-8")
+
+        let url = tempDir.appendingPathComponent(".ai/agents/agent-config.json")
+        let json = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: url)) as? [String: Any]
+        let agents = json?["agents"] as? [String: [String: String]]
+        XCTAssertEqual(agents?["Quill Ashwood (swift-worker-2)"]?["model"],
+                       "claude-opus-4-8")
+        XCTAssertEqual(agents?["Quill Ashwood (swift-worker-2)"]?["provider"],
+                       "anthropic")
+    }
+
+    func testClearingDefaultRemovesDeployConfig() {
+        let store = makeStore()
+        let project = makeProject(store)
+        let agent = addSession(store, name: "Solo", projectID: project.id)
+        store.setAgentDefaultModel(agent, provider: "anthropic", model: "m")
+        store.setAgentDefaultModel(agent, provider: "", model: "")  // clear
+
+        // No configured agents left → the file is removed, not left stale.
+        let url = tempDir.appendingPathComponent(".ai/agents/agent-config.json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     /// A record the user closed (declinedPromotions) must not resurrect.

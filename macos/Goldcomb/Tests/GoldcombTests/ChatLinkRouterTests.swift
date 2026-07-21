@@ -46,4 +46,26 @@ final class ChatLinkRouterTests: XCTestCase {
         let s = ChatLinkRouter.attributed("just a normal message")
         XCTAssertNil(s.runs.first { $0.link != nil })
     }
+
+    func testDecorateComposesOnExistingBoldRuns() {
+        // The Markdown path hands decorate an already-styled AttributedString;
+        // ticket links must be added without disturbing the bold run.
+        var attr = AttributedString("see NEXA-84 now")
+        if let r = attr.range(of: "see") {
+            attr[r].inlinePresentationIntent = .stronglyEmphasized
+        }
+        let out = ChatLinkRouter.decorate(attr)
+        // The pre-existing bold survives.
+        let bold = out.runs.first { out[$0.range].characters.starts(with: "see") }
+        XCTAssertNotNil(bold?.inlinePresentationIntent)
+        // And the ticket became a link.
+        XCTAssertEqual(out.runs.first { $0.link != nil }?.link,
+                       ChatLinkRouter.url(for: "NEXA-84"))
+    }
+
+    func testDecoratePreservesPlainTextContent() {
+        // Attribute-only: the visible characters are unchanged.
+        let out = ChatLinkRouter.decorate(AttributedString("ping user re NEXA-9"))
+        XCTAssertEqual(String(out.characters), "ping user re NEXA-9")
+    }
 }

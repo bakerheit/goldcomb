@@ -715,6 +715,9 @@ struct ProjectView: View {
 
     @State private var board: ScrumBoard?
     @State private var threadList: [ThreadSummary] = []
+    @State private var showGitFiles = false
+    /// The changed file whose diff is on screen (NEXA-99) — nil = no sheet.
+    @State private var diffFile: GitStatus.File? = nil
     private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -728,11 +731,25 @@ struct ProjectView: View {
         }
         .onAppear(perform: reload)
         .onReceive(refresh) { _ in reload() }
+        .sheet(item: $diffFile) { file in
+            DiffView(session: session, file: file)
+        }
+        // Leaving the sheet drops its pending reply/error so the next open
+        // starts from the loading state rather than the last file's diff.
+        .onChange(of: diffFile) { target in
+            if target == nil {
+                session.gitDiff = nil
+                session.gitDiffError = nil
+            }
+        }
     }
 
     private func reload() {
         board = ScrumBoard.load(projectDir: session.directory)
         threadList = ThreadSummary.loadAll(projectDir: session.directory)
+        // Refresh the header's git state on the same tick as everything else
+        // (no dedicated poller). A no-op when the process is down.
+        session.requestGitStatus()
     }
 
     private var header: some View {
@@ -743,6 +760,81 @@ struct ProjectView: View {
             Text(session.directory.path)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
+            // Git working-tree status (NEXA-97): only for repos — non-repo
+            // projects render nothing here and stay clean.
+            if let git = session.gitStatus {
+                gitRow(git)
+            }
+        }
+    }
+
+    // MARK: git status
+
+    /// Branch glyph + name, plus a tappable dirty-count badge when the tree
+    /// has changes. The badge opens a popover listing the changed files.
+    @ViewBuilder
+    private func gitRow(_ git: GitStatus) -> some View {
+        HStack(spacing: 8) {
+            Label(git.branch, systemImage: "arrow.triangle.branch")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            if git.dirtyCount > 0 {
+                Button {
+                    showGitFiles.toggle()
+                } label: {
+                    Text("\(git.dirtyCount)")
+                        .font(.caption2.monospacedDigit().bold())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Comb.amber.opacity(0.2), in: Capsule())
+                        .foregroundStyle(Comb.amber)
+                }
+                .buttonStyle(.plain)
+                .help("\(git.dirtyCount) changed file\(git.dirtyCount == 1 ? "" : "s")")
+                .popover(isPresented: $showGitFiles, arrowEdge: .bottom) {
+                    gitFilesPopover(git)
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    @ViewBuilder
+    private func gitFilesPopover(_ git: GitStatus) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            gitFileSection("Staged", files: git.staged)
+            gitFileSection("Unstaged", files: git.unstaged)
+            gitFileSection("Untracked", files: git.untracked)
+        }
+        .padding(14)
+        .frame(minWidth: 260, maxWidth: 420, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func gitFileSection(_ title: String, files: [GitStatus.File]) -> some View {
+        if !files.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("\(title) (\(files.count))")
+                    .font(.caption.bold())
+                    .foregroundStyle(Comb.amber)
+                ForEach(files) { file in
+                    // Tap a file to see its diff (NEXA-99); the row is a
+                    // plain button so the popover chrome stays unchanged.
+                    Button {
+                        showGitFiles = false
+                        diffFile = file
+                    } label: {
+                        Text(file.path)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show \(file.status == .untracked ? "file" : "diff")")
+                }
+            }
         }
     }
 

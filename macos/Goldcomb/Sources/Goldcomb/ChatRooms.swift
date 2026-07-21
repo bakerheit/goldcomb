@@ -105,24 +105,43 @@ struct ChatRoom: Identifiable, Equatable {
 
     /// Should `name` be woken by `pending` — the messages they haven't seen?
     ///
-    /// Waking every participant on every message is what makes a group chat
-    /// quadratic: one post costs a full-context turn per other agent, and each
-    /// of those may post again. So delivery follows what the message actually
-    /// says. Naming someone addresses them; the human broadcasts (they're the
-    /// one steering); and the message that opens a room broadcasts so a
-    /// discussion can start. Anything else is a remark to the room — the user
-    /// reads it in the app, nobody is woken, and the thread settles instead of
-    /// ping-ponging on their bill.
+    /// Waking every agent on every *agent* message is what makes a group chat
+    /// quadratic, so agent-to-agent chatter stays targeted: naming someone
+    /// wakes them, and an untagged agent remark wakes nobody (the thread
+    /// settles instead of ping-ponging on the user's bill).
+    ///
+    /// A *user* post is different — it's their floor. It wakes every agent so
+    /// anyone can chime in, even when the user @-tagged one specific agent: the
+    /// tag sets who's *expected* to answer (see `expects`), not who's *allowed*
+    /// to. The digest tells the tagged agent a reply is expected and the others
+    /// to speak up only if they have something to add.
     func addresses(_ name: String, in pending: [ChatMessage]) -> Bool {
         if pending.contains(where: { $0.mentions(name) }) { return true }
-        // Someone else was named: this exchange isn't ours to answer.
+        // The user's floor: broadcast so everyone can chime in — @-tags are
+        // expectation, not exclusivity.
+        if pending.contains(where: { $0.isUser }) { return true }
+        // An agent named others (not this one): a targeted agent-to-agent
+        // exchange — don't fan it out to the whole room.
         let namedAnyone = participants.contains { p in
             p != "user" && pending.contains { $0.mentions(p) }
         }
         if namedAnyone { return false }
-        if pending.contains(where: { $0.isUser }) { return true }
         // Nothing has been read yet anywhere — this is the room's kickoff.
         return messages.count == pending.count
+    }
+
+    /// Was `name` @-tagged in `pending` — i.e. a reply is specifically expected
+    /// of them, as opposed to being woken as a participant who *may* chime in?
+    func expects(_ name: String, in pending: [ChatMessage]) -> Bool {
+        pending.contains { $0.mentions(name) }
+    }
+
+    /// The agent participants @-tagged across `pending` (for composer/UI hints
+    /// and the "expected responders" line). Excludes the human.
+    func taggedAgents(in pending: [ChatMessage]) -> [String] {
+        participants.filter { p in
+            p != "user" && pending.contains { $0.mentions(p) }
+        }
     }
 
     static func loadAll(projectDir: URL) -> [ChatRoom] {

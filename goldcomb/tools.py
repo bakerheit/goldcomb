@@ -38,6 +38,64 @@ def _chat_run(args):
     return _chats_mod.chat_tool(args)
 
 
+def _git_dir(args: dict[str, Any]) -> str:
+    """The repo to inspect: the tool's project_dir arg, or the cwd."""
+    return str(Path(args.get("project_dir") or os.getcwd()).expanduser())
+
+
+def _git_status(args: dict[str, Any]) -> str:
+    from . import git_tools
+    res = git_tools.git_status(_git_dir(args))
+    if "error" in res:
+        return f"Error: {res['error']}"
+    lines = [
+        f"branch: {res['branch']}  (ahead {res['ahead']}, behind {res['behind']})"
+    ]
+    if not res["files"]:
+        lines.append("clean — no changes")
+    else:
+        for f in res["files"]:
+            lines.append(f"  {f['status']:<9} {f['path']}")
+    return _truncate("\n".join(lines))
+
+
+def _git_diff(args: dict[str, Any]) -> str:
+    from . import git_tools
+    res = git_tools.git_diff(
+        _git_dir(args), path=args.get("path"),
+        staged=bool(args.get("staged")),
+    )
+    if "error" in res:
+        return f"Error: {res['error']}"
+    return _truncate(res["diff"])
+
+
+def _git_log(args: dict[str, Any]) -> str:
+    from . import git_tools
+    res = git_tools.git_log(_git_dir(args), n=int(args.get("n", 20) or 20))
+    if isinstance(res, dict) and "error" in res:
+        return f"Error: {res['error']}"
+    if not res:
+        return "(no commits yet)"
+    lines = [
+        f"{c['hash'][:9]}  {c['date']}  {c['author']}  {c['subject']}"
+        for c in res
+    ]
+    return _truncate("\n".join(lines))
+
+
+def _git_branch(args: dict[str, Any]) -> str:
+    from . import git_tools
+    res = git_tools.git_branch(_git_dir(args))
+    if "error" in res:
+        return f"Error: {res['error']}"
+    lines = [f"current: {res['current']}"]
+    for b in res["branches"]:
+        mark = "* " if b == res["current"] else "  "
+        lines.append(f"{mark}{b}")
+    return _truncate("\n".join(lines))
+
+
 MAX_OUTPUT = 30_000  # cap tool output returned to the model
 # Refuse / abort a shell command if free disk falls below this floor. A runaway
 # copy that would fill the disk is killed here instead of taking the machine down.
@@ -360,6 +418,76 @@ BUILTIN_TOOLS: list[Tool] = [
         ),
         _run_bash,
         dangerous=True,
+    ),
+    Tool(
+        ToolSpec(
+            name="git_status",
+            description="Show the git working-tree status (current branch, "
+                        "ahead/behind counts, and changed files each tagged "
+                        "staged/unstaged/untracked). Prefer this over "
+                        "run_bash(\"git status\").",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_dir": {"type": "string",
+                                    "description": "Repo dir (default: cwd)"},
+                },
+            },
+        ),
+        _git_status,
+    ),
+    Tool(
+        ToolSpec(
+            name="git_diff",
+            description="Show a unified git diff. Without args, the whole "
+                        "working tree; pass path to scope to one file, or "
+                        "staged=true for the index. Prefer this over "
+                        "run_bash(\"git diff\").",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_dir": {"type": "string",
+                                    "description": "Repo dir (default: cwd)"},
+                    "path": {"type": "string",
+                             "description": "Limit the diff to one file"},
+                    "staged": {"type": "boolean",
+                               "description": "Diff the index (staged changes)"},
+                },
+            },
+        ),
+        _git_diff,
+    ),
+    Tool(
+        ToolSpec(
+            name="git_log",
+            description="List recent commits (hash, author, date, subject), "
+                        "newest first. Prefer this over run_bash(\"git log\").",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_dir": {"type": "string",
+                                    "description": "Repo dir (default: cwd)"},
+                    "n": {"type": "integer",
+                          "description": "Max commits (default 20)"},
+                },
+            },
+        ),
+        _git_log,
+    ),
+    Tool(
+        ToolSpec(
+            name="git_branch",
+            description="List local branches and show the current one. Prefer "
+                        "this over run_bash(\"git branch\").",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project_dir": {"type": "string",
+                                    "description": "Repo dir (default: cwd)"},
+                },
+            },
+        ),
+        _git_branch,
     ),
     Tool(
         ToolSpec(
@@ -702,6 +830,9 @@ def describe_call(name: str, args: dict[str, Any]) -> str:
         return f"$ {args.get('command', '')}"
     if name in ("read_file", "write_file", "edit_file", "list_dir"):
         return f"{name}({args.get('path', '')})"
+    if name in ("git_status", "git_diff", "git_log", "git_branch"):
+        detail = args.get("path") or args.get("project_dir") or ""
+        return f"{name}({detail})" if detail else name
     if name == "deploy_agent":
         label = args.get("label") or "agent"
         task = " ".join(str(args.get("task", "")).split())

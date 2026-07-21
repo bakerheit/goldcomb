@@ -128,6 +128,9 @@ The one-shot management interface is intended for native clients and automation.
 JSON-only and never include API-key material:
 
 ```bash
+goldcomb config presets --json   # known-provider presets (type, base URL,
+                                 # default model, env var) for an "Add provider"
+                                 # picker — so a user only needs to paste a key
 goldcomb config list --json
 goldcomb config add --json --name work --type openai \
   --default-model gpt-4o --api-key-stdin < key.txt

@@ -2,16 +2,35 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ChatView: View {
+    @EnvironmentObject var store: SessionStore
     @ObservedObject var session: AgentSession
     @State private var draft = ""
     @State private var showHistory = false
     @State private var historyThreads: [ThreadSummary] = []
     @State private var attachments: [URL] = []
     @State private var showFilePicker = false
-    @State private var dropTargeted = false
     @State private var pickedProvider = ""
     @State private var pickedModel = ""
     @State private var showQuestionSheet = false
+
+    /// A tapped ticket link routes to that ticket's Sprint view (NEXA-84);
+    /// anything else falls through to the system. Set at the top level so the
+    /// whole transcript (and TranscriptRow stays store-free) inherits it.
+    private var openTicketLink: OpenURLAction {
+        OpenURLAction { url in
+            if let ticket = ChatLinkRouter.ticket(from: url) {
+                store.focusTicket(ticket, in: store.projectID(forDirectory: session.directory))
+                return .handled
+            }
+            return .systemAction
+        }
+    }
+
+    /// Layer ticket-id links and the @user highlight onto a message's
+    /// Markdown-parsed inline runs, in the app palette.
+    private func decorate(_ attr: AttributedString) -> AttributedString {
+        ChatLinkRouter.decorate(attr, linkColor: Comb.gold, userColor: Comb.honey)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -37,19 +56,21 @@ struct ChatView: View {
         .toolbar {
             ToolbarItemGroup {
                 Button {
-                    historyThreads = ThreadSummary
-                        .loadAll(projectDir: session.directory)
-                        // Only this agent's own threads: legacy aliases count
-                        // as the same identity, sub-agent threads don't.
-                        .filter { AgentIdentity.matches(session.name, headerAgent: $0.agent)
-                                  && !AgentIdentity.isSubagent($0.agent) }
+                    reloadHistory()
                     showHistory = true
                 } label: {
                     Label("History", systemImage: "clock.arrow.circlepath")
                 }
                 .help("This agent's past conversations")
                 .popover(isPresented: $showHistory, arrowEdge: .bottom) {
+                    // Reload on appear, not only in the button action: setting
+                    // the list @State in the same cycle that flips showHistory
+                    // races the popover's first render, so it came up empty and
+                    // only filled on a second open. onAppear fires each time the
+                    // popover is shown, so it's always fresh (and picks up newly
+                    // saved conversations too).
                     historyPopover
+                        .onAppear(perform: reloadHistory)
                 }
                 Button {
                     session.interrupt()
@@ -109,30 +130,71 @@ struct ChatView: View {
         } message: {
             Text(session.pendingConfirm ?? "")
         }
+        .environment(\.openURL, openTicketLink)
     }
 
     private var transcript: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(session.transcript) { item in
-                        TranscriptRow(item: item)
-                            .id(item.id)
+                if session.transcript.isEmpty {
+                    // New session: nothing to show yet — same empty-state
+                    // pattern as ChatsTabView's "No chats yet".
+                    ContentUnavailableView(
+                        "No messages yet",
+                        systemImage: "bubble.left",
+                        description: Text("Send a message below to start the "
+                                          + "conversation with \(session.name).")
+                    )
+                    .frame(maxWidth: .infinity)
+                    .containerRelativeFrame(.vertical) { h, _ in max(h - 28, 0) }
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(session.transcript.enumerated()),
+                                id: \.element.id) { idx, item in
+                            // Day separators + row timestamps (NEXA-118), the
+                            // room transcript's scheme ported onto
+                            // TranscriptItem.ts. Mostly invisible in a live
+                            // chat (same-day rows get a plain HH:mm); it earns
+                            // its keep on resumed threads spanning days.
+                            if idx == 0
+                                || TranscriptTime.startsNewDay(
+                                    item.ts, after: session.transcript[idx - 1].ts) {
+                                TranscriptDaySeparator(date: item.ts)
+                            }
+                            TranscriptRow(item: item, decorate: decorate,
+                                          ts: item.ts, showTimestamp: true)
+                                .id(item.id)
+                        }
                     }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // Opening a chat should land on the newest message, not the top.
+            // The onChange handlers below only fire once this view is already
+            // observing, so a transcript that's already populated when the view
+            // appears (switching agents, or after a resume hydrates history)
+            // would otherwise sit at the first message. Jump to the end on
+            // appear — async so the LazyVStack has laid out its rows first.
+            .onAppear { scrollToEnd(proxy, animated: false) }
             .onChange(of: session.transcript.count) {
-                if let last = session.transcript.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+                scrollToEnd(proxy, animated: true)
             }
             .onChange(of: session.transcript.last?.text) {
-                if let last = session.transcript.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
-                }
+                scrollToEnd(proxy, animated: true)
             }
+        }
+    }
+
+    private func scrollToEnd(_ proxy: ScrollViewProxy, animated: Bool) {
+        guard let last = session.transcript.last else { return }
+        let jump = { proxy.scrollTo(last.id, anchor: .bottom) }
+        // On first appear the rows aren't laid out yet, so scrolling in the
+        // same tick no-ops; defer a tick. (Live updates are already laid out.)
+        if animated {
+            withAnimation { jump() }
+        } else {
+            DispatchQueue.main.async(execute: jump)
         }
     }
 
@@ -215,6 +277,16 @@ struct ChatView: View {
         .background(.bar)
     }
 
+    /// (Re)load this agent's saved conversations for the history popover. Only
+    /// this agent's own threads: legacy aliases count as the same identity,
+    /// sub-agent threads don't (NEXA-31 matching).
+    private func reloadHistory() {
+        historyThreads = ThreadSummary
+            .loadAll(projectDir: session.directory)
+            .filter { AgentIdentity.matches(session.name, headerAgent: $0.agent)
+                      && !AgentIdentity.isSubagent($0.agent) }
+    }
+
     /// This agent's saved conversations: click one to resume it in place.
     private var historyPopover: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -261,42 +333,35 @@ struct ChatView: View {
     }
 
     private var inputBar: some View {
+        // Shared composer core (NEXA-110): tray + field + paperclip + send/stop.
+        // Agent-chat slots: the slash palette rides the accessory strip; the
+        // utility row (commands, model chip, sudo, new-conversation) is this
+        // stack's own and stays below.
         VStack(spacing: 6) {
-            if !attachments.isEmpty {
-                attachmentChips
-            }
-            HStack(spacing: 8) {
-                TextField("Message the agent…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .onSubmit(sendDraft)
-                if session.isRunning {
-                    Button {
-                        session.interrupt()
-                    } label: {
-                        Image(systemName: "stop.circle.fill")
-                            .font(.system(size: 28))
-                            .foregroundStyle(.red)
-                            .frame(width: 36, height: 36)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Stop this turn")
-                } else {
-                    Button(action: sendDraft) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 28))
-                            .frame(width: 36, height: 36)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend)
-                    .help("Send (Return)")
+            SharedComposerView(
+                draft: $draft,
+                staged: $attachments,
+                placeholder: "Message the agent…",
+                trayTint: Comb.gold,
+                lineLimit: 1...6,
+                showsStop: session.isRunning,
+                buttonSize: 28,
+                canSend: canSend,
+                onSubmit: sendDraft,
+                onSend: sendDraft,
+                onStop: session.interrupt,
+                onAttach: { showFilePicker = true },
+                leading: { EmptyView() },
+                trailing: { EmptyView() }
+            ) {
+                if !slashSuggestions.isEmpty {
+                    slashPalette
                 }
             }
             utilityRow
         }
-        .padding(10)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 10)
         .fileImporter(
             isPresented: $showFilePicker,
             allowedContentTypes: [.item],
@@ -306,47 +371,42 @@ struct ChatView: View {
                 attachments += urls.filter { !attachments.contains($0) }
             }
         }
-        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-            for provider in providers {
-                _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                    guard let url else { return }
-                    DispatchQueue.main.async {
-                        if !attachments.contains(url) { attachments.append(url) }
-                    }
-                }
-            }
-            return true
-        }
-        .background(dropTargeted ? Comb.gold.opacity(0.08) : Color.clear)
+        .inAttachmentDropSurface(urls: $attachments)
     }
 
-    /// Files queued for the next message, shown as removable chips. Paths are
-    /// appended to the message — the agent reads them with its own tools.
-    private var attachmentChips: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(attachments, id: \.self) { url in
-                    HStack(spacing: 4) {
-                        Image(systemName: "doc")
-                            .font(.caption)
-                        Text(url.lastPathComponent)
-                            .font(.caption)
+    /// Commands matching what the user has typed after "/", shown above the
+    /// composer. Clicking one runs it.
+    private var slashSuggestions: [SlashCommand] {
+        SlashCommands.suggestions(for: draft)
+    }
+
+    private var slashPalette: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(slashSuggestions) { cmd in
+                Button {
+                    if cmd.isEnabled(session) { cmd.run(session) }
+                    draft = ""
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: cmd.icon)
+                            .foregroundStyle(Comb.gold)
+                            .frame(width: 18)
+                        Text("/\(cmd.name)").font(.callout.weight(.medium))
+                        Text(cmd.subtitle)
+                            .font(.caption).foregroundStyle(.secondary)
                             .lineLimit(1)
-                        Button {
-                            attachments.removeAll { $0 == url }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Remove")
+                        Spacer(minLength: 4)
                     }
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(Comb.gold.opacity(0.12), in: Capsule())
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .disabled(!cmd.isEnabled(session))
+                .opacity(cmd.isEnabled(session) ? 1 : 0.4)
             }
         }
+        .background(.quaternary.opacity(0.5),
+                    in: RoundedRectangle(cornerRadius: 8))
     }
 
     /// The button strip under the field: attach, model switcher, sudo, and
@@ -362,6 +422,8 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
             .help("Attach files (or drop them here)")
+
+            commandMenu
 
             modelChip
 
@@ -396,11 +458,49 @@ struct ChatView: View {
         .foregroundStyle(.secondary)
     }
 
+    /// Slash commands, discoverable without typing "/". Same actions the
+    /// composer palette runs.
+    private var commandMenu: some View {
+        Menu {
+            ForEach(SlashCommands.all) { cmd in
+                Button {
+                    if cmd.isEnabled(session) { cmd.run(session) }
+                } label: {
+                    Label("/\(cmd.name) — \(cmd.subtitle)", systemImage: cmd.icon)
+                }
+                .disabled(!cmd.isEnabled(session))
+            }
+        } label: {
+            Image(systemName: "slash.circle")
+                .frame(width: 32, height: 30)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Commands")
+    }
+
     /// Live provider · model, switchable in place: every provider the agent
     /// knows, with its cached model list (server `use` command; in-memory,
     /// this session only).
     private var modelChip: some View {
         Menu {
+            // Promote the live model to this agent's default, so it also runs
+            // on it when woken for a group chat or delegated to — not just in
+            // this chat (Agents tab does the same).
+            Button {
+                store.setAgentDefaultModel(session, provider: session.provider,
+                                           model: session.model)
+            } label: {
+                Label(session.defaultModel == session.model
+                      ? "Default: \(session.model)"
+                      : "Set \(session.model) as default",
+                      systemImage: "pin")
+            }
+            .disabled(session.model.isEmpty || session.model == "…"
+                      || session.defaultModel == session.model)
+            Divider()
             ForEach(session.knownProviders.keys.sorted(), id: \.self) { name in
                 Section(name) {
                     let models = session.knownProviders[name] ?? []
@@ -420,6 +520,17 @@ struct ChatView: View {
                             }
                         }
                     }
+                    Divider()
+                    // The ready event only carries the built-in list; this
+                    // pulls the provider's full live catalog.
+                    Button {
+                        session.refreshModels(provider: name)
+                    } label: {
+                        Label(session.modelsLoading
+                              ? "Refreshing…" : "Refresh from API",
+                              systemImage: "arrow.clockwise")
+                    }
+                    .disabled(session.modelsLoading)
                 }
             }
         } label: {
@@ -443,12 +554,19 @@ struct ChatView: View {
         // session.processIsLive rather than isAlive: the flag lags behind a
         // process death (async termination handler) and the send path guards
         // too, but the composer shouldn't offer a send that can't go through.
-        session.processIsLive && !session.isRunning
-            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || !attachments.isEmpty)
+        // The draft/staged check is the shared ComposerSendRules (NEXA-110).
+        ComposerSendRules.canSend(
+            draft: draft, staged: attachments.count,
+            modeGate: session.processIsLive && !session.isRunning)
     }
 
     private func sendDraft() {
+        // A bare "/command" runs an action instead of sending a message.
+        if let cmd = SlashCommands.match(draft) {
+            if cmd.isEnabled(session) { cmd.run(session) }
+            draft = ""
+            return
+        }
         guard canSend else { return }
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         if !attachments.isEmpty {
@@ -466,23 +584,45 @@ struct ChatView: View {
 
 struct TranscriptRow: View {
     let item: TranscriptItem
+    /// Ticket-link / @user decoration hook, passed down from ChatView so this
+    /// row stays store-free (the openURL handler lives at ChatView's top
+    /// level and covers the whole transcript).
+    var decorate: ((AttributedString) -> AttributedString)? = nil
+    /// When the row happened (nil hides the label; the shell passes item.ts).
+    var ts: Date? = nil
+    /// Show the HH:mm label under user/assistant bubbles (NEXA-118), the
+    /// room transcript's timestamp placement.
+    var showTimestamp = false
     @State private var expanded = false
 
     var body: some View {
         switch item.kind {
         case .user:
-            HStack {
+            HStack(alignment: .bottom) {
                 Spacer(minLength: 60)
-                Text(item.text)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.tint.opacity(0.15), in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .trailing, spacing: 2) {
+                    MarkdownMessage(text: item.text, decorate: decorate)
+                        .textSelection(.enabled)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Comb.gold.opacity(0.22), in: RoundedRectangle(cornerRadius: 10))
+                    if showTimestamp, let ts {
+                        Text(TranscriptTime.timestamp(ts))
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
             }
         case .assistant:
-            Text(markdown(item.text))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                MarkdownMessage(text: item.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if showTimestamp, let ts {
+                    Text(TranscriptTime.timestamp(ts))
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
         case .toolCall:
             Label {
                 Text(item.text)
@@ -525,11 +665,23 @@ struct TranscriptRow: View {
         }
     }
 
-    private func markdown(_ text: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: text,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(text)
+}
+
+/// Day-separator band between transcript rows (NEXA-118), shared with the
+/// chat transcript: a Today / Yesterday / "EEEE, MMM d" label flanked by
+/// hairlines, the room transcript's separator verbatim on `Date`.
+struct TranscriptDaySeparator: View {
+    let date: Date
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            Text(TranscriptTime.dayLabel(date))
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.tertiary)
+            VStack { Divider() }
+        }
+        .padding(.vertical, 6)
     }
 }
 

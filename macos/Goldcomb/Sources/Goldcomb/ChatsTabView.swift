@@ -88,12 +88,12 @@ struct ChatsTabView: View {
                     .font(.callout)
                     .lineLimit(1)
                 if let last = room.messages.last {
-                    Text("\(last.isUser ? "You" : shortName(last.from)): \(last.text)")
+                    Text("\(last.isUser ? "You" : NameFormatting.shortName(last.from)): \(last.text)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 } else {
-                    Text(room.participants.map(shortName).joined(separator: ", "))
+                    Text(room.participants.map(NameFormatting.shortName).joined(separator: ", "))
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -115,13 +115,6 @@ struct ChatsTabView: View {
             }
         }
         .padding(.vertical, 2)
-    }
-
-    /// "Quill Ashwood (swift-worker-2)" → "Quill Ashwood" for tight rows.
-    private func shortName(_ name: String) -> String {
-        name == "user" ? "You"
-            : String(name.split(separator: "(").first ?? Substring(name))
-                .trimmingCharacters(in: .whitespaces)
     }
 }
 
