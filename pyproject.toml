@@ -17,6 +17,11 @@ dependencies = [
     "prompt_toolkit>=3.0",
 ]
 
+[project.optional-dependencies]
+# Claude mode (/mode claude): delegate turns to the Claude Code harness. The SDK
+# bundles the Claude Code CLI. Install with:  pip install "goldcomb[claude]"
+claude = ["claude-agent-sdk>=0.2"]
+
 [project.scripts]
 goldcomb = "goldcomb.cli:main"
 

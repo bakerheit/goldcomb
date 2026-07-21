@@ -58,7 +58,7 @@ COMMANDS = [
     "help", "setup", "provider", "use", "model", "models", "system", "tools",
     "sudo", "render", "set", "theme", "scrum", "tickets", "memory", "clear",
     "compact", "history", "save", "load", "config", "exit", "threads",
-    "resume", "new",
+    "resume", "new", "mode",
 ]
 
 #: System prompt for the one-off summarization call behind /compact. The goal
@@ -161,6 +161,9 @@ class App:
         self.persist = True
         self.approved_tools: set[str] = set()
         self.auto_approve = False
+        # Execution engine: "native" (the tool loop below) or "claude" (delegate
+        # to the Claude Agent SDK — see engines/claude.py and cmd_mode).
+        self.engine = self.cfg.settings.get("engine") or "native"
         self._last_models: list[str] = []  # remembered from the last /models
         self._cmd_counts: dict[str, int] = {}
         self._edit_counts: dict[str, int] = {}
@@ -188,6 +191,16 @@ class App:
             )
         entry = dict(self.cfg.providers[name])
         entry["api_key"] = self.cfg.resolve_api_key(name)
+        if self.engine == "claude":
+            from .engines.claude import ClaudeEngine
+            from .providers import normalize_type
+            claude_entry = dict(entry)
+            # Claude mode always runs the Claude Code (Anthropic) harness. A
+            # non-Anthropic provider's key must not leak in as ANTHROPIC_API_KEY,
+            # so drop it and let the SDK use ambient auth / Claude Code's login.
+            if normalize_type(entry.get("type", "")) != "anthropic":
+                claude_entry.pop("api_key", None)
+            return ClaudeEngine(name, claude_entry, auto_approve=self.auto_approve)
         return build_provider(name, entry)
 
     MEMORY_FILES = ("GOLDCOMB.md", "NEXAIS.md", ".nexais/memory.md")
@@ -786,6 +799,8 @@ class App:
             "resume": self.cmd_resume,
             "continue": self.cmd_resume,
             "new": self.cmd_new,
+            "mode": self.cmd_mode,
+            "engine": self.cmd_mode,  # alias
             "exit": lambda a: False,
             "quit": lambda a: False,
             "q": lambda a: False,
@@ -1209,6 +1224,56 @@ class App:
             )
         else:
             self.console.print("Sudo mode: [accent2]off[/accent2]")
+
+    def cmd_mode(self, args) -> None:
+        """Switch execution engine: native (goldcomb's tool loop, any provider)
+        or claude (delegate the turn to the Claude Agent SDK / Claude Code)."""
+        from .engines import ENGINES
+        from .engines.claude import sdk_available
+        from .providers import normalize_type
+
+        if not args:
+            self._show_mode()
+            return
+        choice = args[0].strip().lower()
+        if choice not in ENGINES:
+            self.console.print(
+                r"[err]Usage:[/err] /mode \[" + "|".join(ENGINES) + "]")
+            return
+        self.engine = choice
+        self.cfg.set_setting("engine", choice)
+        if choice == "claude":
+            if not sdk_available():
+                self.console.print(
+                    "[warn]Claude mode set, but the Claude Agent SDK isn't "
+                    "installed yet:[/warn]\n  [accent]pip install claude-agent-sdk[/accent]")
+            pname = self.cfg.current_provider or ""
+            ptype = normalize_type(self.cfg.providers.get(pname, {}).get("type", ""))
+            if ptype != "anthropic":
+                self.console.print(
+                    f"[dim]Note: claude mode always runs the Claude Code (Anthropic) "
+                    f"harness; the active '{pname}' provider is only used for its key "
+                    f"if it's Anthropic. Auth falls back to your Claude Code login / "
+                    f"ANTHROPIC_API_KEY.[/dim]")
+            self.console.print(
+                "Engine: [accent2]claude[/accent2]  "
+                "[dim](turns run via the Claude Code harness — its own tools, "
+                "auto-approved)[/dim]")
+        else:
+            self.console.print(
+                "Engine: [accent2]native[/accent2]  "
+                "[dim](goldcomb's own tool loop, any provider)[/dim]")
+
+    def _show_mode(self) -> None:
+        from .engines.claude import sdk_available
+        note = ""
+        if self.engine == "claude" and not sdk_available():
+            note = "  [warn](SDK not installed — pip install claude-agent-sdk)[/warn]"
+        self.console.print(
+            f"Engine: [accent2]{self.engine}[/accent2]{note}\n"
+            "[dim]native = goldcomb's tool loop (any provider); "
+            "claude = the Claude Code harness (Anthropic). "
+            r"Switch with /mode \[native|claude].[/dim]")
 
     def cmd_render(self, args) -> None:
         if args and args[0] in ("on", "off"):
@@ -1942,6 +2007,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-tools", action="store_true", help="Disable file/shell tools.")
     parser.add_argument("--sudo", action="store_true",
                         help="Auto-approve all tool calls without asking (like /sudo on).")
+    parser.add_argument("--engine", choices=["native", "claude"], default=None,
+                        help="Execution engine: 'native' (goldcomb's own tool "
+                             "loop, any provider) or 'claude' (delegate the turn "
+                             "to the Claude Agent SDK / Claude Code harness).")
     parser.add_argument("--serve", action="store_true",
                         help="Headless session for GUIs: NDJSON events on stdout, "
                              "commands on stdin (see goldcomb/server.py).")
@@ -1978,6 +2047,11 @@ def main(argv: list[str] | None = None) -> int:
             cfg.settings["role"] = args.role
     if args.team:
         cfg.settings["team"] = args.team  # in-memory only, like role
+
+    if args.engine:
+        # In-memory only: an explicit --engine overrides for this run without
+        # rewriting the persisted default (parallel serve sessions share config).
+        cfg.settings["engine"] = args.engine
 
     if args.serve:
         from .server import serve
