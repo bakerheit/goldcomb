@@ -7,9 +7,17 @@ import os
 import sys
 from typing import Any
 
+from pathlib import Path
+
+from . import oauth as oauth_mod
 from .config import Config
 from .presets import PRESETS
 from .providers import PROVIDER_TYPES
+
+
+def _pending_path(cfg: Config) -> Path:
+    """Where the in-progress OAuth PKCE verifier is stashed (next to config)."""
+    return cfg.path.parent / "oauth-pending.json"
 
 
 def _default_base_url(ptype: str) -> str:
@@ -73,6 +81,17 @@ def _parser() -> argparse.ArgumentParser:
         cmd.add_argument("--current", action="store_true")
         if action == "update":
             cmd.add_argument("--new-name")
+    # Claude subscription (OAuth) — the app drives the two-step browser flow.
+    ourl = sub.add_parser("oauth-url")
+    ourl.add_argument("--json", action="store_true", required=True)
+    oex = sub.add_parser("oauth-exchange")
+    oex.add_argument("--json", action="store_true", required=True)
+    oex.add_argument("--name", required=True)
+    oex.add_argument("--code-stdin", action="store_true", required=True)
+    oex.add_argument("--current", action="store_true")
+    olo = sub.add_parser("oauth-logout")
+    olo.add_argument("--json", action="store_true", required=True)
+    olo.add_argument("--name", required=True)
     return parser
 
 
@@ -86,6 +105,36 @@ def run(argv: list[str]) -> int:
         cfg = Config.load()
         if args.action == "list":
             result: dict[str, Any] = cfg.redacted()
+        elif args.action == "oauth-url":
+            # Step 1: mint PKCE + state, stash the verifier, hand back the URL.
+            verifier, challenge = oauth_mod.generate_pkce()
+            state = oauth_mod.new_state()
+            oauth_mod.save_pending(_pending_path(cfg), state, verifier)
+            print(json.dumps({"ok": True,
+                              "url": oauth_mod.authorize_url(challenge, state),
+                              "state": state}, separators=(",", ":")))
+            return 0
+        elif args.action == "oauth-exchange":
+            # Step 2: exchange the pasted code using the stashed verifier, store
+            # the credential on the (anthropic) provider, creating it if needed.
+            pending = oauth_mod.load_pending(_pending_path(cfg))
+            if pending is None:
+                raise ValueError("no pending login — start with oauth-url first")
+            _state, verifier = pending
+            code = sys.stdin.read().strip()
+            if not code:
+                raise ValueError("no authorization code provided on stdin")
+            creds = oauth_mod.exchange_code(code, verifier)
+            if args.name not in cfg.providers:
+                cfg.add_provider(args.name, "anthropic")
+            cfg.set_oauth(args.name, creds.to_dict())
+            if args.current:
+                cfg.use_provider(args.name)
+            oauth_mod.clear_pending(_pending_path(cfg))
+            result = {"ok": True, **cfg.redacted()}
+        elif args.action == "oauth-logout":
+            cfg.clear_oauth(args.name)
+            result = {"ok": True, **cfg.redacted()}
         else:
             key = sys.stdin.read().rstrip("\r\n") if args.api_key_stdin else None
             if args.action == "add":
@@ -101,6 +150,6 @@ def run(argv: list[str]) -> int:
             result = {"ok": True, **cfg.redacted()}
         print(json.dumps(result, separators=(",", ":")))
         return 0
-    except (ValueError, KeyError, OSError) as exc:
+    except (ValueError, KeyError, OSError, oauth_mod.OAuthError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, separators=(",", ":")))
         return 2

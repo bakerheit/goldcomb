@@ -60,16 +60,14 @@ final class AgentSession: ObservableObject, Identifiable {
     let name: String
     let directory: URL
     let sudoAtLaunch: Bool
-    /// Optional persona passed as `--role` (e.g. "planner" — the Tickets
-    /// board's scrum master). Shapes the system prompt, not the tool set.
-    let personaRole: String?
-    /// User-facing organizational role. This is metadata only and is shown in
-    /// the sidebar; it is deliberately separate from the CLI persona role.
-    /// Display-only (never passed to the process), so it's editable live from
-    /// the agent config sheet with no restart.
+    /// The agent's role — a single free-text field (the old persona enum and
+    /// display role are unified into this). Shown in the sidebar AND passed as
+    /// `--role` at launch, where it's injected into the system prompt (the
+    /// names "planner"/"advisor" still carry rich built-in personas; anything
+    /// else is used as-is). Changing it needs a restart to reach the process.
     @Published var role: String
     /// Free-form user-facing notes about this agent's responsibilities.
-    /// Display-only, editable live (see `role`).
+    /// Display-only, editable live.
     @Published var description: String
     /// Project this agent is grouped under in the sidebar, if any.
     var projectID: UUID?
@@ -159,14 +157,13 @@ final class AgentSession: ObservableObject, Identifiable {
     @Published var crashOffered = false
 
     init(id: UUID = UUID(), name: String, directory: URL, sudo: Bool,
-         personaRole: String? = nil, role: String = "", description: String = "",
+         role: String = "", description: String = "",
          defaultProvider: String? = nil, defaultModel: String? = nil) {
         self.id = id
         self.name = name
         self.directory = directory
         self.sudoAtLaunch = sudo
         self.sudo = sudo
-        self.personaRole = personaRole
         self.role = role.trimmingCharacters(in: .whitespacesAndNewlines)
         self.description = description.trimmingCharacters(in: .whitespacesAndNewlines)
         self.defaultProvider = defaultProvider
@@ -188,7 +185,9 @@ final class AgentSession: ObservableObject, Identifiable {
         // thread history are stamped with it, so the Project tab can show
         // which agents are working on which tickets.
         var args = baseArgs + ["--serve", "--agent-name", name]
-        if let personaRole { args += ["--role", personaRole] }
+        // The unified free-text role: injected into the system prompt (the CLI
+        // treats "planner"/"advisor" as rich personas, anything else as-is).
+        if !role.isEmpty { args += ["--role", role] }
         if let teamContext { args += ["--team", teamContext] }
         // The agent's own default model, if the user set one — so it runs on
         // its configured model whenever the process starts (group chat,

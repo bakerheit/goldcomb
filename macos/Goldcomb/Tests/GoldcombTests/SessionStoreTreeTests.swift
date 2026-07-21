@@ -273,7 +273,7 @@ final class SessionStoreTreeTests: XCTestCase {
     func testSavedAgentFullRoundTrip() throws {
         let agent = SavedAgent(
             id: UUID(), name: "Ada", directory: "/tmp/x", sudo: true,
-            role: "Lead", description: "owns quality", personaRole: "planner",
+            role: "Lead", description: "owns quality",
             provider: "anthropic", model: "claude",
             projectID: UUID(), parentID: UUID())
 
@@ -283,7 +283,6 @@ final class SessionStoreTreeTests: XCTestCase {
         XCTAssertEqual(a.id, agent.id)
         XCTAssertEqual(a.role, "Lead")
         XCTAssertEqual(a.description, "owns quality")
-        XCTAssertEqual(a.personaRole, "planner")
         XCTAssertEqual(a.provider, "anthropic")
         XCTAssertEqual(a.model, "claude")
         XCTAssertEqual(a.projectID, agent.projectID)
@@ -299,7 +298,6 @@ final class SessionStoreTreeTests: XCTestCase {
         let a = try JSONDecoder().decode(SavedAgent.self, from: Data(json.utf8))
         XCTAssertNil(a.parentID)
         XCTAssertNil(a.projectID)
-        XCTAssertNil(a.personaRole)
         XCTAssertFalse(a.sudo)
         XCTAssertEqual(a.role, "")
     }

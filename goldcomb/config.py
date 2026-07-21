@@ -254,9 +254,11 @@ class Config:
         self.save()
 
     def key_source(self, name: str) -> str:
-        if self.providers.get(name, {}).get("api_key"):
-            return "config"
         entry = self.providers.get(name, {})
+        if entry.get("oauth", {}).get("refresh_token"):
+            return "subscription"  # Claude Pro/Max via OAuth (see oauth.py)
+        if entry.get("api_key"):
+            return "config"
         for env_var, _name, ptype in ENV_PROVIDERS:
             if ptype == entry.get("type") and os.environ.get(env_var):
                 return "env"
@@ -270,6 +272,31 @@ class Config:
             if ptype == entry.get("type") and os.environ.get(env_var):
                 return os.environ[env_var]
         return None
+
+    # -- OAuth (Claude subscription) credentials --------------------------
+
+    def oauth_credentials(self, name: str) -> dict | None:
+        """The stored OAuth credential for a provider (access/refresh/expires),
+        or None. See goldcomb/oauth.py."""
+        oauth = self.providers.get(name, {}).get("oauth")
+        return oauth if isinstance(oauth, dict) and oauth.get("refresh_token") else None
+
+    def set_oauth(self, name: str, creds: dict) -> None:
+        """Store (or replace) a provider's OAuth credential and persist. An
+        OAuth-authed provider needs no api_key; leave any existing one alone."""
+        if name not in self.providers:
+            raise KeyError(name)
+        self.providers[name]["oauth"] = {
+            "access_token": creds.get("access_token", ""),
+            "refresh_token": creds.get("refresh_token", ""),
+            "expires_at": creds.get("expires_at", 0),
+        }
+        self.save()
+
+    def clear_oauth(self, name: str) -> None:
+        if name in self.providers:
+            self.providers[name].pop("oauth", None)
+            self.save()
 
     def redacted(self) -> dict[str, Any]:
         providers = [

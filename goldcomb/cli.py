@@ -55,10 +55,10 @@ from .ui import Renderer, clear_viewport
 from . import threads
 
 COMMANDS = [
-    "help", "setup", "provider", "use", "model", "models", "system", "tools",
-    "sudo", "render", "set", "theme", "scrum", "tickets", "memory", "clear",
-    "compact", "history", "save", "load", "config", "exit", "threads",
-    "resume", "new",
+    "help", "setup", "login", "logout", "provider", "use", "model", "models",
+    "system", "tools", "sudo", "render", "set", "theme", "scrum", "tickets",
+    "memory", "clear", "compact", "history", "save", "load", "config", "exit",
+    "threads", "resume", "new",
 ]
 
 #: System prompt for the one-off summarization call behind /compact. The goal
@@ -186,9 +186,37 @@ class App:
             raise ProviderError(
                 "No provider configured. Run  /setup  for a guided menu."
             )
-        entry = dict(self.cfg.providers[name])
-        entry["api_key"] = self.cfg.resolve_api_key(name)
-        return build_provider(name, entry)
+        return build_provider(name, self._provider_entry(name))
+
+    def _provider_entry(self, name: str) -> dict:
+        """The config entry to build provider ``name`` with, auth resolved: a
+        Claude subscription (OAuth) yields a fresh ``oauth_token`` (refreshed
+        here if it's expiring), otherwise the resolved ``api_key``.
+
+        Note: each serve process refreshes independently. Refresh is rare (once
+        per multi-hour token lifetime), but if Anthropic rotates refresh tokens,
+        concurrent sessions could contend — a central token broker would be the
+        robust fix; not built yet.
+        """
+        entry = dict(self.cfg.providers.get(name, {}))
+        creds = self.cfg.oauth_credentials(name)
+        if creds:
+            from . import oauth as oauth_mod
+            c = oauth_mod.Credentials.from_dict(creds)
+            if oauth_mod.needs_refresh(c):
+                try:
+                    c = oauth_mod.refresh_tokens(c.refresh_token)
+                except oauth_mod.OAuthError as e:
+                    raise ProviderError(
+                        f"Claude subscription token refresh failed: {e} — "
+                        "log in again with  /login."
+                    )
+                self.cfg.set_oauth(name, c.to_dict())
+            entry["oauth_token"] = c.access_token
+            entry.pop("api_key", None)  # Bearer and x-api-key are exclusive
+        else:
+            entry["api_key"] = self.cfg.resolve_api_key(name)
+        return entry
 
     MEMORY_FILES = ("GOLDCOMB.md", "NEXAIS.md", ".nexais/memory.md")
     MEMORY_MAX_CHARS = 6000
@@ -606,8 +634,10 @@ class App:
             )
         except ValueError as e:
             return f"Error: {e}"
-        entry = dict(self.cfg.providers[pname])
-        entry["api_key"] = self.cfg.resolve_api_key(pname)
+        try:
+            entry = self._provider_entry(pname)  # OAuth or api_key, refreshed
+        except ProviderError as e:
+            return f"Error: {e}"
         try:
             provider = build_provider(pname, entry)
         except ProviderError as e:
@@ -759,6 +789,8 @@ class App:
             "?": self.cmd_help,
             "setup": self.cmd_setup,
             "wizard": self.cmd_setup,
+            "login": self.cmd_login,
+            "logout": self.cmd_logout,
             "provider": self.cmd_provider,
             "providers": self.cmd_provider,
             "use": self.cmd_use,
@@ -879,6 +911,69 @@ class App:
         self._announce_added(name, ptype, preset.default_model if preset else "")
 
     # ---- guided setup ------------------------------------------------------
+
+    def cmd_login(self, args) -> None:
+        """Log in with a Claude Pro/Max subscription (OAuth). Attaches the
+        subscription to an anthropic provider (default name 'claude'), which the
+        session then uses instead of an API key.
+
+        NOTE: this uses Claude Code's OAuth client to reach your subscription —
+        a grey area under Anthropic's terms that Anthropic can restrict. The
+        token endpoints/scopes are community-known Claude Code values.
+        """
+        import webbrowser
+
+        from . import oauth as oauth_mod
+
+        name = (args[0].strip() if args else "") or "claude"
+        verifier, challenge = oauth_mod.generate_pkce()
+        state = oauth_mod.new_state()
+        url = oauth_mod.authorize_url(challenge, state)
+        self.console.print(
+            "[bold]Log in with your Claude subscription[/bold]\n"
+            "[dim]This authorizes goldcomb via Claude Code's OAuth — using a "
+            "subscription in a third-party tool is a grey area in Anthropic's "
+            "terms and may stop working.[/dim]\n"
+        )
+        self.console.print(f"1. Open this URL and approve:\n   [accent]{url}[/accent]\n")
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - a headless box just uses the printed URL
+            pass
+        try:
+            pasted = self._ask_secret("2. Paste the code shown after approving: ")
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("\n[dim]Cancelled.[/dim]")
+            return
+        if not pasted.strip():
+            self.console.print("[dim]Cancelled.[/dim]")
+            return
+        try:
+            creds = oauth_mod.exchange_code(pasted, verifier, state)
+        except oauth_mod.OAuthError as e:
+            self.console.print(f"[err]Login failed:[/err] {escape(str(e))}")
+            return
+        if name not in self.cfg.providers:
+            self.cfg.add_provider(name, "anthropic")
+        self.cfg.set_oauth(name, creds.to_dict())
+        self.cfg.use_provider(name)
+        self.console.print(
+            f"[ok]Logged in.[/ok] Provider [accent2]{name}[/accent2] now uses "
+            "your Claude subscription. [dim]/logout to disconnect.[/dim]"
+        )
+
+    def cmd_logout(self, args) -> None:
+        """Disconnect a Claude subscription from its provider."""
+        name = (args[0].strip() if args else "") or self.cfg.current_provider or ""
+        if not name or not self.cfg.oauth_credentials(name):
+            self.console.print(
+                "[dim]No subscription login to remove"
+                + (f" on '{name}'" if name else "") + ".[/dim]")
+            return
+        self.cfg.clear_oauth(name)
+        self.console.print(
+            f"[ok]Disconnected[/ok] the Claude subscription from {name}. "
+            "[dim]Set an API key with /provider if you want to keep using it.[/dim]")
 
     def cmd_setup(self, args) -> None:
         """Interactive wizard: pick a provider from a menu, paste a key, go."""
@@ -1557,6 +1652,8 @@ HELP_TEXT = r"""[bold]goldcomb commands[/bold]
 
 [heading]Providers[/heading]
   [cmd]/setup[/cmd]                                 guided menu — pick a provider, paste a key
+  [cmd]/login[/cmd] \[name]                          use a Claude Pro/Max subscription (OAuth)
+  [cmd]/logout[/cmd] \[name]                         disconnect a subscription login
   [cmd]/provider add[/cmd] <preset|name type> …     add a provider (e.g. /provider add kimi)
   [cmd]/provider list[/cmd]                         show configured providers
   [cmd]/provider remove[/cmd] <name>                delete a provider
@@ -1771,6 +1868,8 @@ def _build_prompt_session(app: App):
         return {
             "/help": None,
             "/setup": None,
+            "/login": None,
+            "/logout": None,
             "/provider": {
                 "add": preset_keys,
                 "list": None,
@@ -1949,9 +2048,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Identity for this agent: stamped on scrum-ticket "
                              "assignees and thread history (default: goldcomb).")
     parser.add_argument("--role", metavar="ROLE",
-                        help="Persona for this agent, e.g. 'planner' (the "
-                             "Tickets-board scrum master). Adds a role block "
-                             "to the system prompt; unknown roles are ignored.")
+                        help="Free-text role for this agent (e.g. 'Backend "
+                             "engineer'), added to the system prompt. The names "
+                             "'planner' and 'advisor' carry rich built-in "
+                             "personas; any other text is used as-is.")
     parser.add_argument("--team", metavar="TEXT",
                         help="Team context for this agent (its lead, peers, "
                              "and reports in the project's agent tree); "
@@ -1969,13 +2069,9 @@ def main(argv: list[str] | None = None) -> int:
         scrum_mod.set_agent(args.agent_name)
         threads.set_agent_name(args.agent_name)
     if args.role:
-        from .roles import role_prompt as _rp
-        if _rp(args.role) is None:
-            print(f"Unknown role {args.role!r} — continuing without one.",
-                  file=sys.stderr)
-        else:
-            # In-memory only: role is per-session, never written to config.
-            cfg.settings["role"] = args.role
+        # Free-text role, injected into the system prompt (roles.role_prompt).
+        # In-memory only: role is per-session, never written to config.
+        cfg.settings["role"] = args.role
     if args.team:
         cfg.settings["team"] = args.team  # in-memory only, like role
 

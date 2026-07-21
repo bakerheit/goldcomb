@@ -94,6 +94,103 @@ final class ProviderSettingsModel: ObservableObject {
         run(action: draft.originalName == nil ? "add" : "update", draft: draft)
     }
 
+    // MARK: - Claude subscription (OAuth)
+
+    private struct OAuthURLReply: Codable { let ok: Bool; let url: String }
+
+    /// Run one `goldcomb config …` subcommand, optionally feeding stdin, and
+    /// return its stdout. Synchronous; call off the main thread.
+    private func runConfig(_ extra: [String], stdin: String? = nil) throws -> Data {
+        let invocation = try AppSettings.commandInvocation()
+        let process = Process(), output = Pipe(), input = Pipe()
+        process.executableURL = URL(fileURLWithPath: invocation.executable)
+        process.arguments = invocation.arguments + extra
+        process.standardOutput = output
+        process.standardError = Pipe()
+        process.standardInput = input
+        try process.run()
+        if let stdin { input.fileHandleForWriting.write(Data(stdin.utf8)) }
+        input.fileHandleForWriting.closeFile()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return data
+    }
+
+    /// Step 1 of the subscription login: get the authorize URL (the CLI also
+    /// stashes the PKCE verifier for the exchange). Opens it in the browser.
+    func beginSubscriptionLogin() {
+        isBusy = true; error = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let data = try self.runConfig(["config", "oauth-url", "--json"])
+                let reply = try JSONDecoder().decode(OAuthURLReply.self, from: data)
+                guard reply.ok, let url = URL(string: reply.url) else {
+                    throw NSError(domain: "goldcomb", code: 1)
+                }
+                DispatchQueue.main.async {
+                    self.isBusy = false
+                    NSWorkspace.shared.open(url)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.error = "Couldn't start login: \(error.localizedDescription)"
+                    self.isBusy = false
+                }
+            }
+        }
+    }
+
+    /// Step 2: exchange the pasted code and attach the subscription to a
+    /// provider (created if needed), making it current.
+    func finishSubscriptionLogin(name: String, code: String) {
+        isBusy = true; error = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let data = try self.runConfig(
+                    ["config", "oauth-exchange", "--json", "--name", name,
+                     "--code-stdin", "--current"],
+                    stdin: code)
+                let listing = try JSONDecoder().decode(ProviderListing.self, from: data)
+                DispatchQueue.main.async {
+                    self.providers = listing.providers
+                    self.current = listing.current["provider"] ?? ""
+                    self.revision = listing.config_revision
+                    self.isBusy = false
+                    NotificationCenter.default.post(name: .configRevisionChanged,
+                                                    object: listing.config_revision)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.error = "Login failed: \(error.localizedDescription)"
+                    self.isBusy = false
+                }
+            }
+        }
+    }
+
+    func logoutSubscription(name: String) {
+        isBusy = true; error = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let data = try self.runConfig(
+                    ["config", "oauth-logout", "--json", "--name", name])
+                let listing = try JSONDecoder().decode(ProviderListing.self, from: data)
+                DispatchQueue.main.async {
+                    self.providers = listing.providers
+                    self.current = listing.current["provider"] ?? ""
+                    self.revision = listing.config_revision
+                    self.isBusy = false
+                    NotificationCenter.default.post(name: .configRevisionChanged,
+                                                    object: listing.config_revision)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.error = error.localizedDescription; self.isBusy = false
+                }
+            }
+        }
+    }
+
     /// Fetch the known-provider presets once (idempotent — no-op if loaded).
     func loadPresets() {
         guard presets.isEmpty else { return }
@@ -158,6 +255,7 @@ extension Notification.Name {
 struct ProvidersSettingsView: View {
     @StateObject private var model = ProviderSettingsModel()
     @State private var draft: ProviderDraft?
+    @State private var showSubLogin = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -170,18 +268,94 @@ struct ProvidersSettingsView: View {
                     HStack {
                         VStack(alignment: .leading) {
                             Text(provider.name + (provider.name == model.current ? "  Current" : ""))
-                            Text("\(provider.type) · key: \(provider.key_source)")
+                            Text("\(provider.type) · \(provider.key_source == "subscription" ? "Claude subscription" : "key: \(provider.key_source)")")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer(); Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     }
                 }.buttonStyle(.plain)
             }
+            subscriptionRow
         }
         .onAppear { model.refresh(); model.loadPresets() }
         .sheet(item: Binding(get: { draft.map(DraftBox.init) }, set: { draft = $0?.value })) { box in
             ProviderEditor(draft: box.value, presets: model.presets) { model.save($0); draft = nil }
         }
+        .sheet(isPresented: $showSubLogin) {
+            SubscriptionLoginSheet(model: model)
+        }
+    }
+
+    /// Sign in with a Claude Pro/Max subscription. Kept visually separate from
+    /// the API-key providers, with the terms caveat inline.
+    private var subscriptionRow: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "person.badge.key")
+                .foregroundStyle(Comb.gold)
+            VStack(alignment: .leading, spacing: 2) {
+                Button("Sign in with Claude subscription…") { showSubLogin = true }
+                    .disabled(model.isBusy)
+                Text("Use a Claude Pro/Max plan instead of an API key. Uses "
+                     + "Claude Code's OAuth — a grey area in Anthropic's terms "
+                     + "that may stop working.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.top, 4)
+    }
+}
+
+/// Two-step subscription login: open the browser (Sign in), then paste the
+/// code Anthropic shows back. The heavy lifting is in the CLI via the model.
+private struct SubscriptionLoginSheet: View {
+    @ObservedObject var model: ProviderSettingsModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = "claude"
+    @State private var code = ""
+    @State private var opened = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Sign in with Claude subscription").font(.headline)
+            Text("A grey area under Anthropic's terms (uses Claude Code's "
+                 + "OAuth). Anthropic can restrict this.")
+                .font(.caption).foregroundStyle(.secondary)
+            LabeledContent("Save as provider") {
+                TextField("claude", text: $name).frame(width: 160)
+            }
+            Button {
+                model.beginSubscriptionLogin()
+                opened = true
+            } label: {
+                Label(opened ? "Re-open sign-in page" : "1. Open sign-in page",
+                      systemImage: "safari")
+            }
+            .disabled(model.isBusy || name.trimmingCharacters(in: .whitespaces).isEmpty)
+            if opened {
+                Text("2. Approve in the browser, copy the code it shows, and "
+                     + "paste it here:")
+                    .font(.caption)
+                TextField("Paste the code", text: $code)
+                    .textFieldStyle(.roundedBorder)
+            }
+            if let error = model.error {
+                Text(error).foregroundStyle(.red).font(.caption)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Finish") {
+                    model.finishSubscriptionLogin(
+                        name: name.trimmingCharacters(in: .whitespaces), code: code)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.isBusy || code.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
     }
 }
 

@@ -15,7 +15,7 @@ Installed command is `goldcomb` (see install.sh); package/entry is `goldcomb` (`
 - `goldcomb/providers/` — one adapter per API (anthropic, openai, gemini, base); normalized Message/Event model. New provider = one file + registry entry.
 - `goldcomb/tools.py` — built-in tools (read_file, write_file, edit_file, list_dir, run_bash) + guardrails (catastrophic-command regexes, disk-free sentinel MIN_FREE_MB).
 - `goldcomb/git_tools.py` — read-only, structured git tools (git_status/git_diff/git_log/git_branch; argv-only, 15s timeout, clean `{error}` dicts for git-missing/not-a-repo/empty-repo, 30k-char truncation). Agent-facing wrappers in `tools.py`; the `--serve` NDJSON `git_status` command (see `server.py`) emits a `git_status` event `{branch,ahead,behind,files}` (or an `error` event).
-- `goldcomb/roles.py` — `--role` personas: `planner` (Tickets-board steward) and `advisor` (per-project financial advisor: cost/budget tracking, `.ai/finance/ledger.md` ledger, accounting setup help).
+- `goldcomb/roles.py` — `--role` is a single **free-text** role, injected into the system prompt (`role_prompt`). Two names carry rich built-in personas: `planner` (Tickets-board steward) and `advisor` (per-project financial advisor: cost/budget tracking, `.ai/finance/ledger.md` ledger, accounting setup help); any other text is used as-is. (Role and persona were unified 2026-07-20 — one field.)
 - `goldcomb/config.py` — persistent config at `~/.config/goldcomb/config.json` (0600), env-var key fallback.
 - `goldcomb/threads.py` — autosaved session threads per project dir; `-c` / `-r` resume. Canonical store is `<config_dir>/projects/<cwd-key>/threads/` (full-fidelity JSON). Every save is also exported (best-effort) in a vendor-neutral interchange format at `<cwd>/.ai/threads/<id>.jsonl` (header line + `{"role","content"}` per line, `agent` field in header; a README.md there documents the format). Threads other tools write into `.ai/threads/` (agent != "goldcomb") are adopted into the canonical store on list/load — import is once-only (existing canonical id = skip). Deletes never prune the export.
 - `goldcomb/ui.py` — spinner, markdown render, status bar.
@@ -26,8 +26,8 @@ Installed command is `goldcomb` (see install.sh); package/entry is `goldcomb` (`
 - SwiftUI frontend over `goldcomb --serve` (NDJSON stdio, see `goldcomb/server.py`). Protocol supports `threads`/`resume` commands + `cwd` in the `ready` event; history also on disk at `<project>/.ai/threads/*.jsonl` (vendor-neutral).
 - Sidebar = collapsible project sections (`Project`: name + folder) with agents nested underneath; ungrouped agents in an "Ungrouped" section. Selection is `SidebarItem` enum (`.project`/`.agent`) on `SessionStore`; `selectedSession` resolves the detail pane (project → its most recent agent).
 - Sheets: `NewProjectSheet` (name + folder picker), `NewSessionSheet(project:)` (project set ⇒ folder fixed to the project's). Project actions (New agent / Rename… / Remove project…) are a shared `projectActions` builder in `ProjectHeader`, presented both as a right-click context menu and a visible `ellipsis` `Menu` button (borderless, indicator hidden) in the header row; actions reach `ContentView` via `NotificationCenter` (`.newAgentRequested` / `.renameProjectRequested` / `.removeProjectRequested`) — sheet/alert state lives in `ContentView`. Remove-project is confirm-gated (alert) and never deletes files: `SessionStore.removeProject` only stops the project's agents and drops it from `store.projects`.
-- Agents tab: per-project agent tree (`AgentsTabView`; `AgentSession.parentID`, `SessionStore.children/treeRoots/teamContext/removeFromTree`). Add root/report via sheet with a CLI persona (`personaRole`: worker/planner/advisor) plus independent user-facing `role` and `description` metadata; remove reparents children upward and rows jump to chat. `teamContext(for:)` renders "Your lead/teammates/reports" and is passed as `--team` at launch (snapshot: applies on next start). Persisted via `SavedAgent.parentID`.
-- Sidebar state persists (NEXA-8): projects + agents (name/folder/sudo/personaRole/display role/description) are saved to `~/Library/Application Support/Goldcomb/SidebarState.json` (versioned Codable, pretty JSON, written on every mutation) and restored at startup — restored agents relaunch their `goldcomb --serve` process. `AgentSession.personaRole` alone maps to CLI `--role`; `AgentSession.role` is display metadata and renders as a sidebar badge immediately left of `sudo`. Legacy state lacking `personaRole` migrates its old `role` value to the persona and leaves the display role empty. Only organizational state lives there; transcripts stay in each project's `.ai/threads/`.
+- Agents tab: per-project agent tree (`AgentsTabView`; `AgentSession.parentID`, `SessionStore.children/treeRoots/teamContext/removeFromTree`). Add root/report via sheet with a free-text `role` (see "Unified role") plus `description` metadata; remove reparents children upward and rows jump to chat. `teamContext(for:)` renders "Your lead/teammates/reports" and is passed as `--team` at launch (snapshot: applies on next start). Persisted via `SavedAgent.parentID`.
+- Sidebar state persists (NEXA-8): projects + agents (name/folder/sudo/role/description) are saved to `~/Library/Application Support/Goldcomb/SidebarState.json` (versioned Codable, pretty JSON, written on every mutation) and restored at startup — restored agents relaunch their `goldcomb --serve` process. `AgentSession.role` is the unified free-text role: passed as `--role` and rendered as a sidebar badge immediately left of `sudo` (see "Unified role" for the migration). Only organizational state lives there; transcripts stay in each project's `.ai/threads/`.
 - Right-side file explorer (`FileExplorer.swift`): `FileNode`/`FileExplorerModel` lazy tree (dirs load on expand, skip-list hides `.git`/`node_modules`/`.venv`/etc.), `FileExplorerView` in the detail pane next to `ChatView`, toggled by a `sidebar.right` toolbar button (`SessionStore.explorerVisible`, persisted). One model per agent in `store.explorers`; auto-refreshes (expansion preserved) when `session.isRunning` goes false so agent-made edits appear. `List(children:)` needs an explicit data collection — the bare single-root form doesn't compile.
 - Verify with `cd macos/Goldcomb && swift build` (Xcode also works; macOS 14+ target).
 
@@ -116,6 +116,47 @@ Installed command is `goldcomb` (see install.sh); package/entry is `goldcomb` (`
 - The loop: deploy once → it joins the roster → configure its default model in
   the config sheet → subsequent deploys of that label honor it. An explicit
   `provider`/`model` on the deploy call still wins over the config.
+
+## Claude subscription auth (OAuth, 2026-07-21)
+- A user can drive the Anthropic provider with a **Claude Pro/Max subscription**
+  instead of an API key. `goldcomb/oauth.py` implements the Authorization-Code +
+  PKCE flow using **Claude Code's public OAuth client** (community-known
+  client_id/endpoints/scopes) — a **grey area under Anthropic's terms** that
+  Anthropic can restrict; surfaced to the user everywhere the flow appears.
+- Auth mechanism: a Bearer access token + `anthropic-beta: oauth-2025-04-20`
+  header, **no `x-api-key`** (the provider's `_headers` picks Bearer when
+  `oauth_token` is set). Credentials (access/refresh/expires) live on the
+  provider entry (`Config.set_oauth`/`oauth_credentials`/`clear_oauth`;
+  `key_source` reports `"subscription"`, never leaked by `redacted()`).
+- Refresh-on-use: `App._provider_entry` refreshes an expiring token before each
+  provider build and persists it (used by both the main turn and deploys). Known
+  gap: each serve process refreshes independently — fine normally (refresh is
+  rare), but concurrent sessions could contend if Anthropic rotates refresh
+  tokens; a central token broker is the robust fix, not built.
+- Entry points: CLI `/login [name]` / `/logout [name]` (interactive: opens URL,
+  paste code). App: Settings → "Sign in with Claude subscription" drives the
+  two-step `config oauth-url` → `config oauth-exchange` commands (the PKCE
+  verifier is stashed in `oauth-pending.json` between steps). `config
+  oauth-logout` disconnects.
+- NOT verified end-to-end: the live token exchange/refresh need a real account +
+  network and Anthropic's undocumented acceptance rules (e.g. it may require the
+  request to look like Claude Code); the pure pieces are unit-tested, the live
+  path is best-effort.
+
+## Unified role (2026-07-20)
+- Role and persona are one **free-text** `role` field. `AgentSession.role` (and
+  `SavedAgent.role`) is the single source; the old `personaRole` enum is gone.
+  Passed as `--role` at launch and injected into the system prompt — `planner`/
+  `advisor` still resolve to their rich built-in blocks (`roles.role_prompt`),
+  any other text is used verbatim as a short role description. Shown as the
+  sidebar badge; editable in the config sheet and the add-agent sheet (a plain
+  text field, no persona picker). Changing it needs a restart to reach the
+  process (like `--team`).
+- Migration: old `SavedAgent` decodes prefer the free-text display `role`,
+  falling back to the old `personaRole` (so persona-only planner/advisor agents
+  keep working); `worker` (the old no-op default) maps to an empty role.
+  `personaRole` is read for migration only and never written back. ProjectView's
+  planner/advisor detection now matches on `role` (case-insensitive).
 
 ## Agent config sheet (2026-07-20)
 - Clicking an agent card in the Agents tab opens `AgentConfigSheet` (its

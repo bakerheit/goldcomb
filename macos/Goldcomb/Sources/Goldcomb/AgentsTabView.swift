@@ -98,13 +98,12 @@ struct AgentsTabView: View {
         }
         .sheet(item: $addTarget) { target in
             AddTreeAgentSheet(parent: target.parent) {
-                name, personaRole, role, description, sudo in
+                name, role, description, sudo in
                 let project = store.projects.first { $0.id == session.projectID }
                 store.createSession(
                     name: name,
                     directory: project?.directory ?? session.directory,
                     sudo: sudo,
-                    personaRole: personaRole,
                     role: role,
                     description: description,
                     parentID: target.parent?.id,
@@ -257,11 +256,6 @@ private struct AgentNodeCard: View {
                     badge("restart", .orange)
                         .help("Provider settings changed; restart this agent to apply them")
                 }
-                if agent.role.isEmpty && !agent.sudo && !agent.hasStaleConfig {
-                    Text(agent.personaRole ?? "worker")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
             }
         }
         .padding(.vertical, 10).padding(.horizontal, 14)
@@ -332,11 +326,10 @@ private struct AgentNodeCard: View {
 /// every agent is a person; roll the dice for a different one.
 private struct AddTreeAgentSheet: View {
     let parent: AgentSession?
-    var onCreate: (String, String?, String, String, Bool) -> Void
+    var onCreate: (String, String, String, Bool) -> Void  // name, role, desc, sudo
     @Environment(\.dismiss) private var dismiss
 
     @State private var name = Names.random()
-    @State private var personaRole = "worker"
     @State private var role = ""
     @State private var agentDescription = ""
     @State private var sudo = false
@@ -354,16 +347,12 @@ private struct AddTreeAgentSheet: View {
                 }
                 .help("Roll a different name")
             }
-            Picker("Persona", selection: $personaRole) {
-                Text("Worker").tag("worker")
-                Text("Planner").tag("planner")
-                Text("Advisor").tag("advisor")
-            }
-            .pickerStyle(.segmented)
-            Text(personaCaption)
+            TextField("Role (e.g. Backend engineer)", text: $role)
+            Text("A short description of this agent's role, added to its "
+                 + "system prompt. \"planner\" and \"advisor\" are special — "
+                 + "they carry rich built-in personas.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            TextField("Display role (optional)", text: $role)
             TextField("Description (optional)", text: $agentDescription, axis: .vertical)
                 .lineLimit(2...4)
             Toggle("sudo — run tool calls without asking", isOn: $sudo)
@@ -374,8 +363,7 @@ private struct AddTreeAgentSheet: View {
                 Button("Create") {
                     let n = name.trimmingCharacters(in: .whitespaces)
                     guard !n.isEmpty else { return }
-                    onCreate(n, personaRole == "worker" ? nil : personaRole,
-                             role, agentDescription, sudo)
+                    onCreate(n, role, agentDescription, sudo)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
@@ -384,20 +372,6 @@ private struct AddTreeAgentSheet: View {
         }
         .padding(20)
         .frame(width: 440)
-    }
-
-    private var personaCaption: String {
-        switch personaRole {
-        case "planner":
-            return "Stewards the ticket board: grooms, plans sprints, files "
-                + "tickets instead of implementing."
-        case "advisor":
-            return "Tracks project costs and budget, keeps a ledger, and helps "
-                + "set up accounting — advise/record only, no product code."
-        default:
-            return "A hands-on agent; it claims tickets under its own name as "
-                + "it works."
-        }
     }
 }
 
@@ -420,7 +394,6 @@ struct AgentConfigSheet: View {
             Divider()
             Form {
                 Section("Identity") {
-                    LabeledContent("Persona", value: agent.personaRole ?? "worker")
                     LabeledContent("Model now",
                                    value: "\(agent.provider) · \(agent.model)")
                     LabeledContent("Folder") {
@@ -431,7 +404,10 @@ struct AgentConfigSheet: View {
                     }
                 }
                 Section("Settings") {
-                    TextField("Display role (optional)", text: $role)
+                    TextField("Role", text: $role)
+                    Text("Added to the system prompt; restart the agent to "
+                         + "apply. \"planner\"/\"advisor\" carry rich personas.")
+                        .font(.caption).foregroundStyle(.secondary)
                     TextField("Description (optional)", text: $description,
                               axis: .vertical)
                         .lineLimit(2...5)

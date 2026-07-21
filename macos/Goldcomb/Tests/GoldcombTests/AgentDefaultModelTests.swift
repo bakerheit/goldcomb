@@ -65,8 +65,6 @@ final class AgentDefaultModelTests: XCTestCase {
     }
 
     func testUpdateAgentMetadataEditsRoleAndDescription() {
-        // The config sheet edits display-only metadata live (no restart) — it's
-        // never passed to the process, only shown in the UI.
         let store = SessionStore(forTesting: true)
         let s = AgentSession(name: "Quill", directory: dir, sudo: false,
                              role: "old", description: "old notes")
@@ -74,9 +72,23 @@ final class AgentDefaultModelTests: XCTestCase {
         store.updateAgentMetadata(s, role: "  Reviewer  ", description: " owns tests ")
         XCTAssertEqual(s.role, "Reviewer")            // trimmed
         XCTAssertEqual(s.description, "owns tests")
-        // Metadata is not part of the launch args (unlike the default model).
+    }
+
+    func testRoleIsPassedAtLaunch() {
+        // The unified role now feeds the system prompt via --role (description
+        // stays display-only).
+        let s = AgentSession(name: "Quill", directory: dir, sudo: false,
+                             role: "Backend engineer", description: "notes")
         let args = s.serveArguments(baseArgs: [])
-        XCTAssertFalse(args.contains("Reviewer"))
+        let ri = args.firstIndex(of: "--role")
+        XCTAssertNotNil(ri)
+        XCTAssertEqual(args[ri! + 1], "Backend engineer")
+        XCTAssertFalse(args.contains("notes"))   // description is not launched
+    }
+
+    func testEmptyRoleIsNotPassed() {
+        let s = AgentSession(name: "Q", directory: dir, sudo: false, role: "")
+        XCTAssertFalse(s.serveArguments(baseArgs: []).contains("--role"))
     }
 
     func testLiveModelIsDistinctFromDefault() {
