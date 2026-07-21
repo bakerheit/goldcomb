@@ -428,6 +428,7 @@ the session's `cwd` so a frontend can locate that folder.
 /system [prompt|clear]             set a custom system prompt
 /tools [on|off]                    toggle file/shell tools
 /sudo [on|off]                     run tool calls without confirmation
+/mode [native|claude]              switch execution engine (see Claude mode)
 /set max_tokens|temperature <v>    tune generation
 /scrum [on|off|show]               per-project ticket tracking (opt-in)
 /threads                           list saved threads for this project
@@ -440,6 +441,35 @@ the session's `cwd` so a frontend can locate that folder.
 ```
 
 During a response, **Ctrl-C** interrupts. **Ctrl-D** or `/exit` quits.
+
+## Claude mode
+
+goldcomb has two execution engines, switchable with `/mode` (or `--engine` at launch):
+
+- **`native`** (default) — goldcomb's own agentic loop with its built-in tools
+  (`read_file`, `write_file`, `edit_file`, `run_bash`, git, memory, …), on **any**
+  configured provider.
+- **`claude`** — hands each turn to the **Claude Code** harness via the
+  [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk). Claude Code runs its
+  own agentic loop and its own tools in the working directory; goldcomb streams the
+  result. Anthropic-only.
+
+```
+pip install "goldcomb[claude]"     # installs the SDK (bundles the Claude Code CLI)
+/mode claude                       # switch this session (persists as the default)
+goldcomb --engine claude -p "..."  # or per-run, without changing the default
+```
+
+**Auth:** claude mode authenticates the way Claude Code does — an `ANTHROPIC_API_KEY`
+in the environment, or Claude Code's own login for a Pro/Max subscription (`claude`
+CLI). An Anthropic provider's stored key is passed through; it does **not** use
+goldcomb's own `/login` OAuth token.
+
+**Caveats (first cut):** claude mode auto-approves the SDK's tools (`acceptEdits`, or
+everything under `--sudo`) — there's no interactive per-tool confirmation yet. goldcomb's
+own features (memory, recall, scrum, sub-agents) are **not** available inside a claude-mode
+turn, and cross-turn conversational memory is best-effort (recent turns are folded into the
+prompt). These are follow-ups.
 
 ## Where config lives
 
@@ -454,6 +484,8 @@ a provider with no stored key falls back to the matching env var at request time
 - `goldcomb/tools.py` — built-in tools with JSON-Schema specs advertised to any provider.
 - `goldcomb/config.py` — persistent providers, model selection, settings.
 - `goldcomb/cli.py` — the REPL, the agentic tool loop, and slash-command dispatch.
+- `goldcomb/engines/` — alternative engines. `claude.py` is a `Provider`-shaped adapter
+  over the Claude Agent SDK for `/mode claude` (see Claude mode).
 
 ## License
 

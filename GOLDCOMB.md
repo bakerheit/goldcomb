@@ -242,3 +242,39 @@ Installed command is `goldcomb` (see install.sh); package/entry is `goldcomb` (`
   (`ChatLinkRouter`, `goldcomb://ticket/<id>`); tapping routes through
   `SessionStore.focusTicket` → selects the room's project and opens its Sprint
   tab (`pendingTicketFocus`, consumed by `ProjectDetailView`).
+
+## Claude mode — pluggable engine (2026-07-21)
+- Two execution engines, chosen by `App.engine` ("native" default | "claude"):
+  `/mode [native|claude]` (alias `/engine`), the `--engine` launch flag, or the
+  persisted `settings["engine"]`. `--engine` is in-memory only (set on
+  `cfg.settings` before `App`/`serve`); `/mode` persists via `set_setting`.
+- **native** = the existing `cli.py` tool loop over `Provider.stream` + `tools.py`
+  (any provider). **claude** = delegate the turn to the **Claude Agent SDK**
+  (`claude-agent-sdk`, optional dep, `pip install "goldcomb[claude]"`), which
+  bundles the Claude Code CLI and runs its own loop/tools. Anthropic-only.
+- Integration trick: `engines/claude.py::ClaudeEngine` implements the
+  `Provider.stream` contract but emits **one** assistant turn with **no**
+  `tool_calls` (the SDK executes tools itself), so `_drive_turn`/`_stream_once`
+  run it unchanged. `get_provider()` returns a `ClaudeEngine` when `engine=="claude"`
+  (dropping a non-Anthropic provider's api_key so it can't leak in as
+  `ANTHROPIC_API_KEY`). Tool activity is surfaced as inline `TextDelta`s that are
+  shown but NOT folded into the saved message.
+- Async→sync bridge: `run_async_stream` runs the SDK's async `query()` on a worker
+  thread + `queue.Queue`, yielding to the sync generator; SDK errors (CLINotFound…)
+  wrap as `ProviderError`. SDK types matched by class *name* (`AssistantMessage`,
+  `TextBlock`, …) so `tests/test_claude_engine.py` is hermetic (fake `query_fn`, no
+  SDK/network; `sys.modules["claude_agent_sdk"]=None` forces the not-installed path).
+- Auth: the SDK reads `ANTHROPIC_API_KEY` (passed via subprocess env, merged over
+  `os.environ`) or Claude Code's own on-disk login for a subscription. It does NOT
+  take goldcomb's `/login` OAuth token programmatically — claude-mode subscription
+  auth is a *separate* Claude Code login. permission_mode = "acceptEdits" (or
+  "bypassPermissions" under `--sudo`); override with `settings["claude_permission_mode"]`.
+- **Known gaps (first cut, follow-ups):** no interactive per-tool confirmation
+  (would need a `can_use_tool` bridge to goldcomb's `_confirm`); goldcomb's
+  memory/recall/scrum/sub-agents don't work inside a claude turn (re-expose as SDK
+  custom/MCP tools); cross-turn memory is best-effort via prompt context (a
+  persistent `ClaudeSDKClient` would fix it); block-level not token-level streaming
+  (`include_partial_messages`); no macOS `--serve` NDJSON adapter / app toggle yet;
+  **live path unverified** (needs the SDK installed + auth), like the OAuth work.
+- Built on committed HEAD (bb60170), so this branch does NOT include the in-flight
+  uncommitted OAuth work — additive + defensive, composes when that lands.

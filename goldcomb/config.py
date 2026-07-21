@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 DEFAULT_SETTINGS: dict[str, Any] = {
     "max_tokens": 4096, "temperature": None, "tools_enabled": True,
     "system_prompt": None, "stream": True, "render_markdown": True,
+    # Execution engine: "native" (goldcomb's own tool loop, any provider) or
+    # "claude" (delegate to the Claude Agent SDK / Claude Code harness).
+    "engine": "native",
 }
 ENV_PROVIDERS = [
     ("ANTHROPIC_API_KEY", "anthropic", "anthropic"),
